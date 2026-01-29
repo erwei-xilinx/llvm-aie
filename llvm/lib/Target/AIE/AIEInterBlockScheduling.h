@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// (c) Copyright 2024-2025 Advanced Micro Devices, Inc. or its affiliates
+// (c) Copyright 2024-2026 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 //
@@ -22,6 +22,7 @@
 #include "AIEDataDependenceHelper.h"
 #include "AIEHazardRecognizer.h"
 #include "AIEPostPipeliner.h"
+#include "AIERegDefUseTracker.h"
 #include "Utils/AIELoopUtils.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
@@ -82,6 +83,13 @@ public:
 // handling.
 enum class BlockType { Regular, Loop, Epilogue };
 
+// PostPipelinerMode determines whether the postpipeliner operates on physical
+// registers or virtualizes them for better scheduling opportunities.
+enum class PostPipelinerMode { None, Physical, Virtual, ReservedVirtual };
+
+// Helper function to get the name of a PostPipelinerMode as a string
+const char *getPostPipelinerModeName(PostPipelinerMode Mode);
+
 // These are states in the state machine that drives scheduling
 enum class SchedulingStage {
   // We are gathering all regions in the block to initialize the BlockState.
@@ -114,6 +122,8 @@ enum class SchedulingStage {
 class FixedpointState {
 public:
   SchedulingStage Stage = SchedulingStage::Scheduling;
+  // PostPipeliner mode - physical or virtual register mode
+  PostPipelinerMode PipelinerMode = PostPipelinerMode::None;
   // Parameters of the loop-aware convergence
   int LatencyMargin = 0;
   SmallMapVector<MachineInstr *, int, 8> PerMILatencyMargin;
@@ -207,6 +217,9 @@ class BlockState {
   // This holds an instance of the PostPipeliner for candidate loops.
   std::unique_ptr<PostPipeliner> PostSWP;
 
+  // This holds an instance of the RegLiveRangeTracker for loops.
+  std::unique_ptr<llvm::RegLiveRangeTracker> RegTracker;
+
 public:
   BlockState(MachineBasicBlock *Block);
   MachineBasicBlock *TheBlock = nullptr;
@@ -271,6 +284,14 @@ public:
   void clearSchedule();
 
   void setPipelined();
+
+  /// Initialize for pipelining - virtualizes physical registers if in test mode
+  void initPipelining();
+
+  /// Restore after failed pipelining - restores physical registers if
+  /// virtualized
+  void restorePipelining();
+
   bool isScheduled() const {
     return FixPoint.Stage == SchedulingStage::SchedulingDone || isPipelined() ||
            pipeliningFailed();

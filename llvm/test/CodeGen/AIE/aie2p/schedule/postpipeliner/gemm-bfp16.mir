@@ -32,6 +32,9 @@
   ; CHECK-NEXT:    nop
   ; CHECK-NEXT:    vlda.conv.fp32.bf16 cml4, [p3], #64; vmul.f dm4, y2, y0, r2
   ; CHECK-NEXT:    vlda.conv.fp32.bf16 cmh4, [p3, #0]
+  ; CHECK-NEXT:    nop
+  ; CHECK-NEXT:    vshuffle x10, x6, x8, r0
+  ; CHECK-NEXT:    vconv.bfp16ebs8.fp32 ex2, dm4; vshuffle x11, x6, x8, r1
   ; CHECK-NEXT:    add.nc lc, r0, #-1
   ; CHECK-NEXT:    movxm ls, #.LBB0_1
   ; CHECK-NEXT:    nopa ; nopb ; vconv.bfp16ebs8.fp32 ex6, dm4; movxm le, #.L_LEnd0; nopv
@@ -62,12 +65,18 @@
   ; CHECK-NEXT:    nopx
   ; CHECK-NEXT:    vconv.bfp16ebs8.fp32 ex4, dm4
   ; CHECK-NEXT:    nop
-  ; CHECK-NEXT:    vconv.bfp16ebs8.fp32 ex8, dm4; vmac.f dm3, dm3, ex2, ex6, r3
+  ; CHECK-NEXT:    vconv.bfp16ebs8.fp32 ex8, dm4
   ; CHECK-NEXT:    nop
   ; CHECK-NEXT:    vmac.f dm2, dm2, ex2, ex4, r3
   ; CHECK-NEXT:    nop
-  ; CHECK-NEXT:    vmac.f dm0, dm0, ex8, ex4, r3
-  ; CHECK-NEXT:    vmac.f dm1, dm1, ex8, ex6, r3
+  ; CHECK-NEXT:    nop
+  ; CHECK-NEXT:    vconv.bfp16ebs8.fp32 ex6, dm4; vmac.f dm3, dm3, ex2, ex8, r3
+  ; CHECK-NEXT:    vmac.f dm1, dm1, ex4, ex8, r3
+  ; CHECK-NEXT:    nop
+  ; CHECK-NEXT:    nop
+  ; CHECK-NEXT:    vmac.f dm2, dm2, ex2, ex6, r3
+  ; CHECK-NEXT:    nop
+  ; CHECK-NEXT:    vmac.f dm0, dm0, ex4, ex6, r3
   ; CHECK-NEXT:    ret lr
   ; CHECK-NEXT:    nop // Delay Slot 5
   ; CHECK-NEXT:    nop // Delay Slot 4

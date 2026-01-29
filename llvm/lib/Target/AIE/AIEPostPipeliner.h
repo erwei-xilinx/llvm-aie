@@ -15,6 +15,7 @@
 #define LLVM_LIB_TARGET_AIE_AIEPOSTPIPELINER_H
 
 #include "AIEHazardRecognizer.h"
+#include "AIEScheduleInterpreter.h"
 #include "AIESlotCounts.h"
 #include "llvm/CodeGen/MachineScheduler.h"
 #include "llvm/CodeGen/ResourceScoreboard.h"
@@ -27,7 +28,12 @@ class AIEHazardRecognizer;
 class MachineOptimizationRemarkEmitter;
 } // namespace llvm
 
+namespace llvm {
+class RegLiveRangeTracker; // Forward declaration
+}
+
 namespace llvm::AIE {
+
 namespace Solver {
 class SolverData;
 class SWPSolver;
@@ -220,8 +226,15 @@ public:
 
 class PostPipeliner {
   const AIEHazardRecognizer &HR;
+  RegLiveRangeTracker &RegTracker;
   ScheduleDAGMI *DAG = nullptr;
   const AIEBaseInstrInfo *TII = nullptr;
+
+  // Schedule interpreter for computing modulo live ranges
+  AIEScheduleInterpreter Interpreter;
+
+  // Event schedule populated during scheduling
+  EventSchedule EventSched;
 
   int FirstUnscheduled = 0;
   int LastUnscheduled = -1;
@@ -288,6 +301,7 @@ class PostPipeliner {
   void computeForward();
   bool computeBackward();
   void computeRecMII();
+  int computeScarceRegMII();
 
   /// Given Earliest and Latest of each node in the first iteration,
   /// compute the smallest length of the linear schedule that is feasible.
@@ -323,13 +337,24 @@ class PostPipeliner {
   /// Top level strategy scheduler
   bool scheduleWithStrategy(PostPipelinerStrategy &Strategy);
 
+  /// Try to schedule scarce ranges by enumerating orders and using
+  /// BurstMostUrgentStrategy.
+  /// Checks applicability, finds scarce ranges, and attempts scheduling.
+  /// Returns true if scheduling succeeded, false otherwise.
+  bool tryScarceRangePacking();
+
   /// Reset dynamic scheduling data.
   /// If FullReset is set, also reset information collected from earlier
   /// data mining scheduling rounds.
   void resetSchedule(bool FullReset);
 
+  /// Try to allocate registers for the current schedule
+  /// Returns true if register allocation succeeds
+  bool tryAllocateRegisters();
+
 public:
-  PostPipeliner(const AIEHazardRecognizer &HR, int NInstr);
+  PostPipeliner(const AIEHazardRecognizer &HR, int NInstr,
+                RegLiveRangeTracker &RegTracker, const MachineFunction &MF);
 
   /// Check whether this is a suitable loop for the PostPipeliner. It also
   /// leaves some useful information.
