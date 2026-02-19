@@ -393,8 +393,7 @@ bool InterBlockScheduling::leaveBlock() {
     BS.clearSchedule();
     PipelineExtractor GenSchedule(*this, BS, *TII);
     auto &PostSWP = BS.getPostSWP();
-    PostSWP.visitPipelineSchedule(GenSchedule);
-    PostSWP.updateTripCount();
+    PostSWP.materializePipeline(GenSchedule);
     break;
   }
   case SchedulingStage::SchedulingDone:
