@@ -1524,7 +1524,7 @@ void llvm::AIEPostRASchedStrategy::buildGraph(ScheduleDAGMI &DAG, AAResults *AA,
   DAG.makeMaps();
   // We are in the postscheduler, RPTracker, PDiffs and LIS are null.
   // For VirtMode, we do want to track LaneMasks though.
-  DAG.buildEdges(Context->AA, RPTracker, PDiffs, LIS, true);
+  DAG.buildEdges(Context->AA, RPTracker, PDiffs, LIS, true, false);
   static_cast<AIEScheduleDAGMI &>(DAG).recordDbgInstrs(Region);
 }
 

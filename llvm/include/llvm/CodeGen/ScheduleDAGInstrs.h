@@ -137,6 +137,11 @@ namespace llvm {
     /// Whether lane masks should get tracked.
     bool TrackLaneMasks = false;
 
+    /// This controls registering single defs in CurrentVRegDefs.
+    /// For special uses of ScheduleDAGInstrs, we can not use the assumption
+    /// that defs dominate all uses.
+    bool AbandonSingleDefs = true;
+
     // State specific to the current scheduling region.
     // ------------------------------------------------
 
@@ -351,7 +356,8 @@ namespace llvm {
     /// traversal of the SUnits vector.
     void buildEdges(AAResults *AA, RegPressureTracker *RPTracker = nullptr,
                     PressureDiffs *PDiffs = nullptr,
-                    LiveIntervals *LIS = nullptr, bool TrackLaneMasks = false);
+                    LiveIntervals *LIS = nullptr, bool TrackLaneMasks = false,
+                    bool AbandonSingleDefs = true);
 
     /// Adds dependencies from instructions in the current list of
     /// instructions being scheduled to scheduling barrier. We want to make sure
