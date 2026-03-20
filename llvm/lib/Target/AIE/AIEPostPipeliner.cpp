@@ -1527,9 +1527,9 @@ bool PostPipeliner::applySolver(const SolverData &Data, SWPSolver &Solver,
 
 bool PostPipeliner::schedule(ScheduleDAGMI &TheDAG, int InitiationInterval,
                              MachineOptimizationRemarkEmitter &More) {
-
   II = InitiationInterval;
   DAG = &TheDAG;
+  DEBUG_SUMMARY(dbgs() << format("PSBEGIN II=%d\n", II));
 
   // We need to set up a scoreboard that gives us some look-ahead.
   // The look-ahead is used heuristically, to see conflicts with future
@@ -1560,6 +1560,7 @@ bool PostPipeliner::schedule(ScheduleDAGMI &TheDAG, int InitiationInterval,
              << "Longest circuit does not fit II." << ore::NV("II", II)
              << ore::NV("BasicBlock", BB->getName());
     });
+    DEBUG_SUMMARY(dbgs() << "PSEND\n");
     return false;
   }
 
@@ -1574,6 +1575,7 @@ bool PostPipeliner::schedule(ScheduleDAGMI &TheDAG, int InitiationInterval,
                << ore::NV("II", II) << ore::NV("ScarceRegMII", ScarceRegMII)
                << ore::NV("BasicBlock", BB->getName());
       });
+      DEBUG_SUMMARY(dbgs() << "PSEND\n");
       return false;
     }
   }
@@ -1587,6 +1589,7 @@ bool PostPipeliner::schedule(ScheduleDAGMI &TheDAG, int InitiationInterval,
     LLVM_DEBUG(
         dbgs()
         << "PostPipeliner: No schedule found with register allocation\n");
+    DEBUG_SUMMARY(dbgs() << "PSEND\n");
     return false;
   }
 
@@ -1598,6 +1601,7 @@ bool PostPipeliner::schedule(ScheduleDAGMI &TheDAG, int InitiationInterval,
   });
 
   LLVM_DEBUG(dbgs() << "PostPipeliner: Success\n");
+  DEBUG_SUMMARY(dbgs() << "PSEND\n");
   return true;
 }
 

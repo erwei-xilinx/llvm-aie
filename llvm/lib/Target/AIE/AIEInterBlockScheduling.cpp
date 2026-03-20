@@ -281,7 +281,7 @@ void InterBlockScheduling::markEpilogueBlocks() {
 }
 
 void InterBlockScheduling::enterFunction(MachineFunction *MF) {
-  DEBUG_BLOCKS(dbgs() << ">> enterFunction " << MF->getName() << "\n");
+  DEBUG_BLOCKS(dbgs() << "PSBEGIN Function " << MF->getName() << "\n");
 
   // Get ourselves a hazard recognizer
   const auto &Subtarget = MF->getSubtarget();
@@ -323,14 +323,14 @@ void InterBlockScheduling::enterFunction(MachineFunction *MF) {
 }
 
 void InterBlockScheduling::leaveFunction() {
-  DEBUG_BLOCKS(dbgs() << "<< leaveFunction\n");
+  DEBUG_BLOCKS(dbgs() << "PSEND Function\n");
   Blocks.clear();
 }
 
 void InterBlockScheduling::enterBlock(MachineBasicBlock *BB) {
   CurrentBlockState = &getBlockState(BB);
   CurrentBlockState->resetRegion();
-  DEBUG_BLOCKS(dbgs() << "  >> enterBlock " << BB->getNumber() << " "
+  DEBUG_BLOCKS(dbgs() << "PSBEGIN Block " << BB->getNumber() << " "
                       << CurrentBlockState->kindAsString() << " FixPointIter="
                       << CurrentBlockState->FixPoint.NumIters
                       << " II=" << CurrentBlockState->FixPoint.II << "\n");
@@ -417,7 +417,7 @@ public:
 
 } // namespace
 bool InterBlockScheduling::leaveBlock() {
-  DEBUG_BLOCKS(dbgs() << "  << leaveBlock "
+  DEBUG_BLOCKS(dbgs() << "PSEND Block "
                       << CurrentBlockState->TheBlock->getNumber() << "\n");
   // After scheduling a basic block, check convergence to determine which block
   // to schedule next and with what parameters
