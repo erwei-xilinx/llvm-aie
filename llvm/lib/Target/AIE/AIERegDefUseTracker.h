@@ -244,6 +244,30 @@ class RegLiveRangeTracker {
   std::vector<const RegLiveRange *> findMostPromisingScarceRanges(
       const DenseSet<MCRegister> &AvailablePhysRegs) const;
 
+  /// Collect base registers from RESERVED live ranges.
+  DenseSet<MCRegister> collectReservedBaseRegs() const;
+
+  /// Populate AvailablePhysRegs from non-reserved live ranges.
+  /// Adds base registers and sub-registers that don't overlap with reserved.
+  void computeAvailableFromLiveRanges(const DenseSet<MCRegister> &ReservedRegs);
+
+  /// Extend AvailablePhysRegs with super-registers whose sub-regs are all
+  /// available.
+  void deriveSuperRegsFromSubRegs();
+
+  /// Add caller-saved registers that are completely unused in the block.
+  /// Uses AllPhysRegOperands member for used registers, and iterates
+  /// MBB.liveins() and MBB.liveouts() directly (with lane mask support).
+  /// @param MBB The machine basic block (for live-in/out iteration).
+  /// @param ImplicitRegs Registers used implicitly.
+  /// @param ReservedRegs Reserved base registers.
+  void addUnusedCallerSavedRegs(MachineBasicBlock &MBB,
+                                const DenseSet<MCRegister> &ImplicitRegs,
+                                const DenseSet<MCRegister> &ReservedRegs);
+
+  /// Mark live ranges as scarce if they have exactly 1 available register.
+  void markScarceRanges();
+
 public:
   RegLiveRangeTracker(MachineBasicBlock &MBB);
 

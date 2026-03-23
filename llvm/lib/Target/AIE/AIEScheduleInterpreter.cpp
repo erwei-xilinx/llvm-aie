@@ -207,15 +207,16 @@ void AIEScheduleInterpreter::dumpEventSchedule(const EventSchedule &Schedule,
     }
   }
 
-  // Print header with cycle numbers
-  OS << " RC     VReg  |";
+  // Print header with cycle numbers.
+  // Reserve 12 characters for register class names to handle long names.
+  OS << " RegClass    VReg  |";
   for (unsigned Cycle = 0; Cycle < Schedule.size(); ++Cycle) {
     OS << format(" %4d |", Cycle);
   }
   OS << "\n";
 
-  // Print separator
-  OS << "--------------+";
+  // Print separator.
+  OS << "-------------------+";
   for (unsigned Cycle = 0; Cycle < Schedule.size(); ++Cycle) {
     OS << "------+";
   }
@@ -230,17 +231,20 @@ void AIEScheduleInterpreter::dumpEventSchedule(const EventSchedule &Schedule,
     OS << "\n";
   };
 
-  // Print each VReg with register events and bypass events on separate lines
+  // Print each VReg with register events and bypass events on separate lines.
   for (unsigned VReg : AllVRegs) {
-    auto Reg = Register::virtReg2Index(VReg);
-    // Print register events
-    OS << format("%7s%6d |", TRI.getRegClassName(MRI.getRegClass(VReg)), Reg);
+    const auto Reg = Register::virtReg2Index(VReg);
+    const char *RCName = TRI.getRegClassName(MRI.getRegClass(VReg));
+
+    // Print register events.
+    // Use %-12.12s to left-align, pad to 12 chars, and truncate at 12 chars.
+    OS << format(" %-12.12s%5d |", RCName, Reg);
     PrintEventRow(RegEventsByVReg[VReg]);
 
-    // Print bypass events if any exist for this VReg
+    // Print bypass events if any exist for this VReg.
     const auto &BypassEvents = BypassEventsByVReg[VReg];
     if (!BypassEvents.empty()) {
-      OS << "       bypass |";
+      OS << "        bypass    |";
       PrintEventRow(BypassEvents);
     }
   }

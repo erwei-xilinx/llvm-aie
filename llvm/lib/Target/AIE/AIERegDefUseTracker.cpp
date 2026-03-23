@@ -20,6 +20,7 @@
 
 #include "AIERegDefUseTracker.h"
 #include "AIEBaseInstrInfo.h"
+#include "AIEBaseRegisterInfo.h"
 #include "Utils/AIEMachineInstrPrint.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -34,6 +35,18 @@
 #define DEBUG_TYPE "aie-reg-liverange"
 
 using namespace llvm;
+
+namespace {
+
+/// Check if a register overlaps with a RegisterMaskPair (live-in/out entry).
+/// Currently uses conservative full-register overlap; lane mask support can
+/// be added later.
+bool overlapsRMP(MCRegister Reg, const MachineBasicBlock::RegisterMaskPair &RMP,
+                 const TargetRegisterInfo *TRI) {
+  return TRI->regsOverlap(Reg, RMP.PhysReg);
+}
+
+} // end anonymous namespace
 
 void RegLiveRange::dumpBrief(const TargetRegisterInfo *TRI) const {
   StringRef Name =
@@ -60,6 +73,12 @@ static cl::opt<std::string> ExcludeLiveRangesByRegClass(
     "aie-exclude-liveranges-by-regclass", cl::Hidden, cl::init(""),
     cl::desc("[AIE] Exclude live ranges of the specified register class name. "
              "Empty string means no filtering."));
+
+static cl::opt<bool> AddUnusedCallerSavedRegs(
+    "aie-add-unused-caller-saved-regs", cl::Hidden, cl::init(false),
+    cl::desc("[AIE] Add unused caller-saved registers to the available "
+             "register pool for pipelining. Only safe when loops with calls "
+             "are excluded from pipelining."));
 
 RegLiveRangeTracker::RegLiveRangeTracker(MachineBasicBlock &MBB)
     : MF(MBB.getParent()), TRI(MF->getSubtarget().getRegisterInfo()),
@@ -490,20 +509,239 @@ void RegLiveRangeTracker::mergeAliasingLiveRanges(
   }
 }
 
+DenseSet<MCRegister> RegLiveRangeTracker::collectReservedBaseRegs() const {
+  DenseSet<MCRegister> ReservedRegs;
+  for (const RegLiveRange &LR : LiveRanges) {
+    if (LR.isReserved()) {
+      ReservedRegs.insert(LR.BaseReg);
+    }
+  }
+  return ReservedRegs;
+}
+
+void RegLiveRangeTracker::computeAvailableFromLiveRanges(
+    const DenseSet<MCRegister> &ReservedRegs) {
+
+  // Lambda to check if a register overlaps with any reserved register.
+  auto OverlapsReserved = [&](MCRegister Reg) {
+    return llvm::any_of(ReservedRegs, [&](MCRegister Reserved) {
+      return TRI->regsOverlap(Reg, Reserved);
+    });
+  };
+
+  // Build AvailablePhysRegs from non-reserved ranges, excluding any
+  // register that overlaps with a reserved register.
+  AvailablePhysRegs.clear();
+  for (const RegLiveRange &LR : LiveRanges) {
+    assert(LR.RegisterClass && "Live range must have a valid register class");
+    assert(LR.BaseReg != MCRegister::NoRegister &&
+           "Live range must have a base register");
+    assert(LR.BaseReg.isPhysical() && "BaseReg must be a physical register");
+
+    // Skip if this range is reserved.
+    if (LR.isReserved()) {
+      continue;
+    }
+
+    // Skip if base register overlaps with any reserved register.
+    // Sub-registers are contained within the base, so if the base doesn't
+    // overlap with reserved, neither will any sub-register.
+    if (OverlapsReserved(LR.BaseReg)) {
+      continue;
+    }
+
+    // Add base register and all its sub-registers.
+    AvailablePhysRegs.insert(LR.BaseReg);
+    for (MCSubRegIterator SubIt(LR.BaseReg, TRI, /*IncludeSelf=*/false);
+         SubIt.isValid(); ++SubIt) {
+      AvailablePhysRegs.insert(*SubIt);
+    }
+  }
+}
+
+void RegLiveRangeTracker::deriveSuperRegsFromSubRegs() {
+  // If all sub-registers of a super-register are available, add the
+  // super-register as well. This avoids repeated computation in PostRegAlloc.
+  SmallVector<MCRegister, 32> RegsToCheck(AvailablePhysRegs.begin(),
+                                          AvailablePhysRegs.end());
+  for (MCRegister AvailReg : RegsToCheck) {
+    for (MCSuperRegIterator SuperIt(AvailReg, TRI, /*IncludeSelf=*/false);
+         SuperIt.isValid(); ++SuperIt) {
+      const MCRegister SuperReg = *SuperIt;
+
+      // Skip if already available.
+      if (AvailablePhysRegs.count(SuperReg))
+        continue;
+
+      // Check if all sub-registers of SuperReg are available.
+      bool AllSubregsAvailable = true;
+      unsigned SubregCount = 0;
+      for (MCSubRegIterator SubIt(SuperReg, TRI, /*IncludeSelf=*/false);
+           SubIt.isValid(); ++SubIt) {
+        ++SubregCount;
+        if (!AvailablePhysRegs.count(*SubIt)) {
+          AllSubregsAvailable = false;
+          break;
+        }
+      }
+
+      // If we have at least 2 sub-registers and all are available,
+      // add this super-register.
+      if (AllSubregsAvailable && SubregCount >= 2) {
+        AvailablePhysRegs.insert(SuperReg);
+      }
+    }
+  }
+}
+
+void RegLiveRangeTracker::addUnusedCallerSavedRegs(
+    MachineBasicBlock &MBB, const DenseSet<MCRegister> &ImplicitRegs,
+    const DenseSet<MCRegister> &ReservedRegs) {
+
+  // This feature is controlled by a command-line option because it changes
+  // the available register pool, which can affect register allocation results.
+  if (!AddUnusedCallerSavedRegs)
+    return;
+
+  // Augment AvailablePhysRegs with caller-saved registers that are completely
+  // unused in this block. Since pipelining excludes loops with calls, these
+  // registers are safe to use as additional allocation candidates.
+  //
+  // A caller-saved register is safe to add if:
+  // 1. It is allocatable (not reserved by the target)
+  // 2. It belongs to a register class used by at least one live range
+  // 3. It does not overlap with any register used in the block (explicit ops)
+  // 4. It does not overlap with any register used implicitly
+  // 5. It does not overlap with any live-in register (respecting lane masks)
+  // 6. It does not overlap with any live-out register (respecting lane masks)
+  // 7. It does not overlap with any reserved live range
+
+  // Collect the set of register classes used by live ranges.
+  SmallPtrSet<const TargetRegisterClass *, 8> UsedRegClasses;
+  for (const RegLiveRange &LR : LiveRanges) {
+    if (LR.RegisterClass) {
+      UsedRegClasses.insert(LR.RegisterClass);
+    }
+  }
+
+  // If no live ranges have register classes, nothing to add.
+  if (UsedRegClasses.empty())
+    return;
+
+  const auto *AIERII = static_cast<const AIEBaseRegisterInfo *>(TRI);
+
+  // Get the call-preserved mask. clobbersPhysReg returns true for caller-saved
+  // registers (those NOT preserved across calls).
+  const uint32_t *PreservedMask =
+      AIERII->getCallPreservedMask(*MF, CallingConv::C);
+  const BitVector AllocatableRegs = TRI->getAllocatableSet(*MF);
+
+  // Generic lambda to check if a register overlaps with any register in a
+  // range. Works with any range that yields MCRegister.
+  auto OverlapsAny = [this](MCRegister Reg, auto &&Range) {
+    return llvm::any_of(Range,
+                        [&](MCRegister R) { return TRI->regsOverlap(Reg, R); });
+  };
+
+  // Generic lambda to check if a register overlaps with any RegisterMaskPair
+  // in a range. Works with MBB.liveins() and MBB.liveouts().
+  auto OverlapsAnyRMP = [this](MCRegister Reg, auto &&Range) {
+    return llvm::any_of(Range,
+                        [&](const MachineBasicBlock::RegisterMaskPair &RMP) {
+                          return overlapsRMP(Reg, RMP, TRI);
+                        });
+  };
+
+  // Helper to check if Reg is caller-saved (clobbered by calls).
+  auto IsCallerSaved = [PreservedMask](MCRegister Reg) {
+    return MachineOperand::clobbersPhysReg(PreservedMask, Reg);
+  };
+
+  // Transformer for AllPhysRegOperands to yield MCRegister.
+  auto ToReg = [](const MachineOperand *MO) { return MO->getReg().asMCReg(); };
+
+  // Iterate over allocatable registers and add unused caller-saved ones.
+  unsigned NumUnusedCallerSavedAdded = 0;
+  for (unsigned RegIdx = 0, E = TRI->getNumRegs(); RegIdx < E; ++RegIdx) {
+    const MCRegister Reg = MCRegister::from(RegIdx);
+
+    // Skip if already available.
+    if (AvailablePhysRegs.count(Reg))
+      continue;
+
+    // Must be allocatable.
+    if (!AllocatableRegs.test(RegIdx))
+      continue;
+
+    // Must be caller-saved (clobbered by calls).
+    if (!IsCallerSaved(Reg))
+      continue;
+
+    // Must belong to at least one register class used by live ranges.
+    bool BelongsToUsedClass = llvm::any_of(
+        UsedRegClasses, [Reg](auto *RC) { return RC->contains(Reg); });
+    if (!BelongsToUsedClass)
+      continue;
+
+    // Must not overlap with any explicitly used register in the block.
+    if (OverlapsAny(Reg, llvm::map_range(AllPhysRegOperands, ToReg)))
+      continue;
+
+    // Must not overlap with any implicit register.
+    if (OverlapsAny(Reg, ImplicitRegs))
+      continue;
+
+    // Must not overlap with any live-in register (respecting lane masks).
+    if (OverlapsAnyRMP(Reg, MBB.liveins()))
+      continue;
+
+    // Must not overlap with any live-out register (respecting lane masks).
+    if (OverlapsAnyRMP(Reg, MBB.liveouts()))
+      continue;
+
+    // Must not overlap with any reserved base register.
+    if (OverlapsAny(Reg, ReservedRegs))
+      continue;
+
+    // This register is safe to use as an additional allocation candidate.
+    AvailablePhysRegs.insert(Reg);
+    ++NumUnusedCallerSavedAdded;
+
+    LLVM_DEBUG(dbgs() << "Added unused caller-saved register: "
+                      << TRI->getName(Reg) << "\n");
+  }
+
+  LLVM_DEBUG(dbgs() << "Added " << NumUnusedCallerSavedAdded
+                    << " unused caller-saved registers to available set\n");
+}
+
+void RegLiveRangeTracker::markScarceRanges() {
+  // Mark live ranges as scarce if they have exactly 1 available register.
+  for (RegLiveRange &LR : LiveRanges) {
+    const TargetRegisterClass *RC = LR.getRegisterClass();
+    if (!RC) {
+      continue;
+    }
+
+    unsigned AvailableCount = 0;
+    for (MCPhysReg PhysReg : *RC) {
+      if (AvailablePhysRegs.count(PhysReg)) {
+        ++AvailableCount;
+        if (AvailableCount > 1) {
+          break;
+        }
+      }
+    }
+
+    LR.setIsScarce(AvailableCount == 1);
+  }
+}
+
 void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
                                   ArrayRef<MachineInstr *> SemanticOrder) {
   assert(!SemanticOrder.empty() && "SemanticOrder must be provided - MBB order "
                                    "is unreliable after scheduling");
   clear();
-
-  // Collect live-out registers from successors.
-  // These are used to detect live-out uses and mark them as reserved.
-  DenseSet<MCRegister> LiveOutRegs;
-  for (MachineBasicBlock *Succ : MBB.successors()) {
-    for (const auto &LI : Succ->liveins()) {
-      LiveOutRegs.insert(LI.PhysReg);
-    }
-  }
 
   // Build instruction order map from semantic order
   // Also track implicit registers to invalidate overlapping explicit ranges
@@ -540,8 +778,8 @@ void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
   DenseMap<MCRegister, int> LiveRegs;
 
   // Initialize with live-out registers using NoLiveRange as sentinel.
-  for (MCRegister LiveOutReg : LiveOutRegs) {
-    LiveRegs[LiveOutReg] = RegLiveRange::NoLiveRange;
+  for (const auto &RMP : MBB.liveouts()) {
+    LiveRegs[RMP.PhysReg] = RegLiveRange::NoLiveRange;
   }
 
   // Map from operand to live range index
@@ -764,102 +1002,12 @@ void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
   pruneByFullCoverage();
 
   // Compute and cache available physical registers.
-  // First, collect all reserved registers.
-  DenseSet<MCRegister> ReservedRegs;
-  for (const RegLiveRange &LR : LiveRanges) {
-    if (LR.isReserved()) {
-      ReservedRegs.insert(LR.BaseReg);
-    }
-  }
+  const DenseSet<MCRegister> ReservedRegs = collectReservedBaseRegs();
+  computeAvailableFromLiveRanges(ReservedRegs);
+  deriveSuperRegsFromSubRegs();
 
-  // Lambda to check if a register overlaps with any reserved register
-  auto OverlapsReserved = [&](MCRegister Reg) {
-    return llvm::any_of(ReservedRegs, [&](MCRegister Reserved) {
-      return TRI->regsOverlap(Reg, Reserved);
-    });
-  };
-
-  // Now build AvailablePhysRegs from non-reserved ranges, excluding any
-  // register that overlaps with a reserved register.
-  AvailablePhysRegs.clear();
-  for (const RegLiveRange &LR : LiveRanges) {
-    assert(LR.RegisterClass && "Live range must have a valid register class");
-    assert(LR.BaseReg != MCRegister::NoRegister &&
-           "Live range must have a base register");
-    assert(LR.BaseReg.isPhysical() && "BaseReg must be a physical register");
-
-    // Skip if this range is reserved
-    if (LR.isReserved()) {
-      continue;
-    }
-
-    // Add base register if it doesn't overlap with reserved registers
-    if (!OverlapsReserved(LR.BaseReg)) {
-      AvailablePhysRegs.insert(LR.BaseReg);
-    }
-
-    // Add sub-registers that don't overlap with reserved registers
-    for (MCSubRegIterator SubIt(LR.BaseReg, TRI, /*IncludeSelf=*/false);
-         SubIt.isValid(); ++SubIt) {
-      if (!OverlapsReserved(*SubIt)) {
-        AvailablePhysRegs.insert(*SubIt);
-      }
-    }
-  }
-
-  // Also derive super-registers from available sub-registers.
-  // If all sub-registers of a super-register are available, add the
-  // super-register as well. This avoids repeated computation in PostRegAlloc.
-  SmallVector<MCRegister, 32> RegsToCheck(AvailablePhysRegs.begin(),
-                                          AvailablePhysRegs.end());
-  for (MCRegister AvailReg : RegsToCheck) {
-    for (MCSuperRegIterator SuperIt(AvailReg, TRI, /*IncludeSelf=*/false);
-         SuperIt.isValid(); ++SuperIt) {
-      const MCRegister SuperReg = *SuperIt;
-
-      // Skip if already available
-      if (AvailablePhysRegs.count(SuperReg))
-        continue;
-
-      // Check if all sub-registers of SuperReg are available
-      bool AllSubregsAvailable = true;
-      unsigned SubregCount = 0;
-      for (MCSubRegIterator SubIt(SuperReg, TRI, /*IncludeSelf=*/false);
-           SubIt.isValid(); ++SubIt) {
-        ++SubregCount;
-        if (!AvailablePhysRegs.count(*SubIt)) {
-          AllSubregsAvailable = false;
-          break;
-        }
-      }
-
-      // If we have at least 2 sub-registers and all are available,
-      // add this super-register
-      if (AllSubregsAvailable && SubregCount >= 2) {
-        AvailablePhysRegs.insert(SuperReg);
-      }
-    }
-  }
-
-  // Mark live ranges as scarce if they have exactly 1 available register.
-  for (RegLiveRange &LR : LiveRanges) {
-    const TargetRegisterClass *RC = LR.getRegisterClass();
-    if (!RC) {
-      continue;
-    }
-
-    unsigned AvailableCount = 0;
-    for (MCPhysReg PhysReg : *RC) {
-      if (AvailablePhysRegs.count(PhysReg)) {
-        ++AvailableCount;
-        if (AvailableCount > 1) {
-          break;
-        }
-      }
-    }
-
-    LR.setIsScarce(AvailableCount == 1);
-  }
+  addUnusedCallerSavedRegs(MBB, ImplicitRegs, ReservedRegs);
+  markScarceRanges();
 
   // Compute and cache the most promising scarce range set.
   MostPromisingScarceRanges = findMostPromisingScarceRanges(AvailablePhysRegs);
