@@ -37,7 +37,6 @@
 # CHECK: 12     |  ..      ..      ..      #       #       ..      ..     
 # CHECK: 13     |  #       #       #       #       #       #       #      
 
-
 --- |
   define dso_local void @gemm(ptr addrspace(5) noalias nocapture writeonly %d, ptr addrspace(6) noalias nocapture readonly %s, i32 noundef %n) local_unnamed_addr {
   entry:

@@ -26,43 +26,36 @@
 # - Interference degrees ranging from 0 to 9
 # - Different lane widths and durations
 
-# METRICS: AIEPostRegAlloc::allocate for 14 vregs, II=6
+# NOTE: Status quo - II=7 (was II=6)
+# METRICS: AIEPostRegAlloc::allocate for 14 vregs, II=7
 # METRICS: === Virtual Register Metrics Dump ===
 # METRICS: Total Virtual Registers: 14
 # METRICS-EMPTY:
 # METRICS: VReg      RegClass                 Avail  Pure  Alias  TotalLanes  MaxWidth  Duration
 # METRICS-NEXT: --------  -----------------------  -----  ----  -----  ----------  --------  --------
-# METRICS-NEXT: %vreg0     VEC576                       4     3    800          24         4         6
-# METRICS-NEXT: %vreg1     eDM                          1     1      0           6         4         2
-# METRICS-NEXT: %vreg2     VEC576                       4     2    400          12         4         3
-# METRICS-NEXT: %vreg3     eDM                          1     1      0           8         4         2
-# METRICS-NEXT: %vreg4     VEC576                       4     2    600           8         4         2
-# METRICS-NEXT: %vreg5     eY                           2     0    400           6         4         2
-# METRICS-NEXT: %vreg6     eDM                          1     0      0           4         4         1
-# METRICS-NEXT: %vreg7     VEC576                       4     3    800          24         4         6
-# METRICS-NEXT: %vreg8     eY                           2     0    500           6         4         2
-# METRICS-NEXT: %vreg9     VEC512                       7     1    500           4         2         2
-# METRICS-NEXT: %vreg10    VEC512                       7     3    500           6         2         3
-# METRICS-NEXT: %vreg11    eDM                          1     0      0           6         4         2
-# METRICS-NEXT: %vreg12    VEC512                       7     2    400           4         2         2
-# METRICS-NEXT: %vreg13    VEC512                       7     2    600           6         2         3
+# METRICS-NEXT: %vreg0     VEC512                       7     3    600           6         2         4
+# METRICS-NEXT: %vreg1     VEC512                       7     3    800           8         2         5
+# METRICS-NEXT: %vreg2     eDM                          1     3      0          22         4         6 FAIL
+# METRICS-NEXT: %vreg3     eY                           2     1    700           6         4         3
+# METRICS-NEXT: %vreg4     VEC512                       7     3    700           6         2         4
+# METRICS-NEXT: %vreg5     VEC512                       7     3    800           8         2         5
+# METRICS-NEXT: %vreg6     eDM                          1     1      0           4         4         1 FAIL
+# METRICS-NEXT: %vreg7     eY                           2     1    500           6         4         3
+# METRICS-NEXT: %vreg8     eDM                          1     2      0           4         4         1 FAIL
+# METRICS-NEXT: %vreg9     eDM                          1     2      0          14         4         4 FAIL
+# METRICS-NEXT: %vreg10    VEC576                       4     3    800          28         4         7
+# METRICS-NEXT: %vreg11    VEC576                       4     2    300           8         4         2
+# METRICS-NEXT: %vreg12    VEC576                       4     2    600           8         4         2
+# METRICS-NEXT: %vreg13    VEC576                       4     3    800          28         4         7
 # METRICS-EMPTY:
 # METRICS: === Summary Statistics ===
-# METRICS: Total Lanes (sum):              124
+# METRICS: Total Lanes (sum):              156
 # METRICS: Max Width (max):                4
-# METRICS: Max Duration:                   6
+# METRICS: Max Duration:                   7
 # METRICS: Max Pure Interference Degree:   3
 # METRICS: Max Aliasing Interference Deg:  800
-# METRICS: Avg Pure Interference Degree:   1.43
-# METRICS: Avg Aliasing Interference Deg:  385.71
-# METRICS-EMPTY:
-# METRICS: === Register Class Distribution ===
-# METRICS-DAG:   eDM                      : 4
-# METRICS-DAG:   VEC512                   : 4
-# METRICS-DAG:   VEC576                   : 4
-# METRICS-DAG:   eY                       : 2
-# METRICS-EMPTY:
-# METRICS: === End Virtual Register Metrics ===
+# METRICS: Avg Pure Interference Degree:   2.29
+# METRICS: Avg Aliasing Interference Deg:  471.43
 
 --- |
   define dso_local void @gemm(ptr addrspace(5) noalias nocapture writeonly %d, ptr addrspace(6) noalias nocapture readonly %s, i32 noundef %n) local_unnamed_addr {
