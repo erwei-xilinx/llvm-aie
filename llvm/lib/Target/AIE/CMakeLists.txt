@@ -130,6 +130,7 @@ add_llvm_target(AIECodeGen
    AIEISelDAGToDAG.cpp
    AIELivenessVector.cpp
    AIELegalizerHelper.cpp
+   AIELiveRangeUtils.cpp
    AIELiveRegs.cpp
    AIELoopClass.cpp
    AIEMachineAlignment.cpp
