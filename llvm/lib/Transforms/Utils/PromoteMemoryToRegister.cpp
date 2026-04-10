@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// Modifications (c) Copyright 2026 Advanced Micro Devices, Inc. or its
+// affiliates
+//
 //===----------------------------------------------------------------------===//
 //
 // This file promotes memory references to be register references.  It promotes
@@ -478,6 +481,13 @@ static void convertMetadataToAssumes(LoadInst *LI, Value *Val,
 static void removeIntrinsicUsers(AllocaInst *AI) {
   // Knowing that this alloca is promotable, we know that it's safe to kill all
   // instructions except for load and store.
+  //
+  // lifetime.start is replaced with a store of undef rather than simply
+  // deleted. This makes the alloca's content explicitly undefined at that
+  // point, so PromoteMemToReg's SSA renaming sees a real definition of undef.
+  // Back-edge phi nodes that would otherwise carry a stale value from the
+  // previous iteration are then naturally resolved to undef, eliminating
+  // spurious loop-carried dependences on the alloca's value.
 
   for (Use &U : llvm::make_early_inc_range(AI->uses())) {
     Instruction *I = cast<Instruction>(U.getUser());
@@ -488,6 +498,20 @@ static void removeIntrinsicUsers(AllocaInst *AI) {
     if (I->isDroppable()) {
       I->dropDroppableUse(U);
       continue;
+    }
+
+    if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+      if (II->isLifetimeStartOrEnd()) {
+        // Replace lifetime intrinsics with a store of undef so SSA renaming
+        // treats the alloca as having an undefined value at those points.
+        // - lifetime.start: the alloca is undefined at the start of a new
+        //   lifetime, breaking spurious loop-carried back-edge phi nodes.
+        // - lifetime.end: the alloca is undefined after its lifetime ends,
+        //   shortening live ranges and reducing register pressure.
+        new StoreInst(UndefValue::get(AI->getAllocatedType()), AI, II);
+        II->eraseFromParent();
+        continue;
+      }
     }
 
     if (!I->getType()->isVoidTy()) {
