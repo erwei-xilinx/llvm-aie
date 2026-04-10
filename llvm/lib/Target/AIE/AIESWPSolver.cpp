@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// (c) Copyright 2025 Advanced Micro Devices, Inc. or its affiliates
+// (c) Copyright 2025-2026 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 // This file contains an interface to create constraints to model a software
@@ -206,6 +206,14 @@ std::vector<int> Z3Solver::getSUCycles() {
     Cycles.push_back(IntVal);
   }
   return Cycles;
+}
+
+void Z3Solver::genResourceExclusion(const ResourceExclusion &Excl) {
+  Solver.add(CycleExprs[Excl.InstrB] - CycleExprs[Excl.InstrA] !=
+             Context.int_val(Excl.CycleDelta));
+  LLVM_DEBUG(dbgs() << "Solver: added resource exclusion: cycle(SU"
+                    << Excl.InstrB << ") - cycle(SU" << Excl.InstrA
+                    << ") != " << Excl.CycleDelta << "\n");
 }
 
 void Z3Solver::genModel(const SolverData &Data, bool SEFStage) {

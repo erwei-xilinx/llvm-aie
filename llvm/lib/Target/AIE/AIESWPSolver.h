@@ -26,6 +26,16 @@
 
 namespace llvm::AIE::Solver {
 
+/// Represents a pairwise resource conflict discovered during
+/// CheckFixedSchedule validation. The constraint says: the linear cycle
+/// difference between InstrB and InstrA must not equal CycleDelta.
+struct ResourceExclusion {
+  int InstrA;
+  int InstrB;
+  /// Linear cycle difference: Schedule[InstrB] - Schedule[InstrA].
+  int CycleDelta;
+};
+
 // These classes describe the feature of the ISA that model the constraints
 // Each instruction has a slot. Dependences between two instructions carry a
 // latency.
@@ -176,6 +186,10 @@ public:
   virtual void genModel(const SolverData &Data, bool SEFStage) = 0;
   // Call the solver on the model. Return whether it was satisfiable.
   virtual bool solveModel() = 0;
+  // Add a resource exclusion constraint discovered from a failed
+  // CheckFixedSchedule validation. The solver can then be re-solved
+  // incrementally.
+  virtual void genResourceExclusion(const ResourceExclusion &Excl) = 0;
   // Generate further instruction conflict constraints
   void conflicts(const SolverData &Data);
 };
@@ -230,6 +244,7 @@ public:
   void genModel(const SolverData &Data, bool SEFStage) override;
   bool solveModel() override;
   std::vector<int> getSUCycles() override;
+  void genResourceExclusion(const ResourceExclusion &Excl) override;
 };
 
 // In the binary formulation, we have a lot of binary variables,

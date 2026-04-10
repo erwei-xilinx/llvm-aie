@@ -31,6 +31,7 @@ namespace llvm::AIE {
 namespace Solver {
 class SolverData;
 class SWPSolver;
+struct ResourceExclusion;
 } // namespace Solver
 
 /// This is a dedicated softwarepipeliner. Its schedule method takes an
@@ -304,6 +305,12 @@ class PostPipeliner {
   /// Helper of solve, applying one specific solver
   bool applySolver(const Solver::SolverData &Data, Solver::SWPSolver &Solver,
                    int NS, bool SEFStage);
+
+  /// Replay a solver schedule to identify the pairwise resource conflict.
+  /// Returns the conflicting pair and their linear cycle delta, or nullopt
+  /// if the conflict cannot be attributed to a single instruction pair.
+  std::optional<Solver::ResourceExclusion>
+  identifyResourceConflict(const std::vector<int> &Schedule) const;
 
   /// Try all approaches to arrive at a SWP schedule for the current II.
   /// If it returns true, a valid schedule is laid down in Info.

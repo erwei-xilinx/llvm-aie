@@ -25,6 +25,7 @@
 #include "llvm/CodeGen/ScheduleDAGInstrs.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include <limits>
+#include <numeric>
 #include <string>
 
 #define DEBUG_TYPE "postpipeliner"
@@ -46,6 +47,11 @@ static cl::opt<int>
 static cl::opt<int> PresetII("aie-postpipeliner-target-ii",
                              cl::desc("II for which to allow the solver"),
                              cl::init(0), cl::Hidden);
+
+static cl::opt<int>
+    SolverRetries("aie-postpipeliner-solver-retries",
+                  cl::desc("Number of solver retries with resource exclusions"),
+                  cl::init(3), cl::Hidden);
 
 PipelineScheduleVisitor::~PipelineScheduleVisitor() {}
 
@@ -1346,34 +1352,122 @@ SolverData PostPipeliner::createSolverData() {
   return Data;
 }
 
+std::optional<ResourceExclusion> PostPipeliner::identifyResourceConflict(
+    const std::vector<int> &Schedule) const {
+  // Sort instruction indices by ascending cycle (matching CheckFixedSchedule
+  // ordering). Break ties by ascending NodeNum.
+  SmallVector<int, 16> Order(NInstr);
+  std::iota(Order.begin(), Order.end(), 0);
+  std::sort(Order.begin(), Order.end(), [&](int A, int B) {
+    if (Schedule[A] != Schedule[B])
+      return Schedule[A] < Schedule[B];
+    return A < B;
+  });
+
+  // Replay the scoreboard build, matching scheduleFirstIteration.
+  const int PipelineDepth = HR.getPipelineDepth();
+  const int Horizon =
+      std::min(II + PipelineDepth, ScoreboardSize - PipelineDepth);
+
+  ResourceScoreboard<FuncUnitWrapper> ReplayBoard;
+  ReplayBoard.config(0, ScoreboardSize - 1);
+
+  for (int K = 0; K < NInstr; K++) {
+    const int N = Order[K];
+    const int ModCycleN = Schedule[N] % II;
+    MachineInstr &MI = *DAG->SUnits[N].getInstr();
+
+    // Check if N conflicts with the current replay scoreboard.
+    if (HR.checkConflict(ReplayBoard, MI, ModCycleN)) {
+      // Identify which previously-placed instruction caused the conflict.
+      for (int P = 0; P < K; P++) {
+        const int M = Order[P];
+        const int ModCycleM = Schedule[M] % II;
+        MachineInstr &MIM = *DAG->SUnits[M].getInstr();
+
+        // Build a single-instruction scoreboard for M.
+        ResourceScoreboard<FuncUnitWrapper> PairBoard;
+        PairBoard.config(0, ScoreboardSize - 1);
+        int Cycle = ModCycleM;
+        while (Cycle < Horizon) {
+          HR.emitInScoreboard(PairBoard, MIM, MIM.getDesc(), Cycle);
+          Cycle += II;
+        }
+
+        if (HR.checkConflict(PairBoard, MI, ModCycleN)) {
+          const int Delta = Schedule[N] - Schedule[M];
+          LLVM_DEBUG(dbgs() << "Resource conflict: SU" << N << " @"
+                            << Schedule[N] << " vs SU" << M << " @"
+                            << Schedule[M] << " (delta=" << Delta << ")\n");
+          return ResourceExclusion{M, N, Delta};
+        }
+      }
+      // Conflict exists but cannot be attributed to a single pair.
+      LLVM_DEBUG(dbgs() << "Resource conflict at SU" << N
+                        << " but no pairwise culprit found\n");
+      return std::nullopt;
+    }
+
+    // Emit N into the replay scoreboard with multi-iteration copies.
+    int Cycle = ModCycleN;
+    while (Cycle < Horizon) {
+      HR.emitInScoreboard(ReplayBoard, MI, MI.getDesc(), Cycle);
+      Cycle += II;
+    }
+  }
+
+  // No conflict found (failure was not a resource issue).
+  return std::nullopt;
+}
+
 bool PostPipeliner::applySolver(const SolverData &Data, SWPSolver &Solver,
                                 int NS, bool SEFStage) {
 
   // We don't model the resource hazards. They would be very tedious to express,
   // since resource uses are offset relative to the instruction cycle. We would
   // need to interpret raw itinerary data, and the modulo constraints on those
-  // would lead to very awkard expressions.
+  // would lead to very awkward expressions.
+  // Instead, we solve an optimistic model and validate with CheckFixedSchedule.
+  // If validation fails due to resource conflicts, we feed back pairwise
+  // exclusion constraints and re-solve incrementally.
   Solver.setScheduleSize(II, NS);
   Solver.genModel(Data, SEFStage);
-  if (!Solver.solveModel()) {
-    return false;
-  }
 
-  // We have a solution of our model, but this is missing some constraints, in
-  // order to save solver time. We extract the cycles, and make a final check
-  // for all constraints using a dedicated strategy.
-  auto Schedule = Solver.getSUCycles();
-  DEBUG_SUMMARY(dbgs() << "Solver found "; for (auto C
-                                                : Schedule) dbgs()
-                                           << C << ", ";
-                dbgs() << "\n";);
-  CheckFixedSchedule S{*DAG, Info, II * NS, Schedule};
-  resetSchedule(/*FullReset=*/true);
-  DEBUG_SUMMARY(dbgs() << "--- Strategy " << S.name() << "\n");
-  if (scheduleWithStrategy(S)) {
-    DEBUG_SUMMARY(dbgs() << "    Strategy " << S.name() << " found II=" << II
-                         << "\n");
-    return true;
+  const int MaxAttempts = 1 + SolverRetries;
+  for (int Attempt = 0; Attempt < MaxAttempts; Attempt++) {
+    if (!Solver.solveModel())
+      return false;
+
+    auto Schedule = Solver.getSUCycles();
+    DEBUG_SUMMARY(dbgs() << "Solver found "; for (auto C
+                                                  : Schedule) dbgs()
+                                             << C << ", ";
+                  dbgs() << "\n";);
+    DEBUG_SUMMARY(dumpCycles(Info, II));
+    CheckFixedSchedule S{*DAG, Info, II * NS, Schedule};
+    resetSchedule(/*FullReset=*/true);
+    DEBUG_SUMMARY(dbgs() << "--- Strategy " << S.name() << "\n");
+    if (scheduleWithStrategy(S)) {
+      DEBUG_SUMMARY(dbgs() << "    Strategy " << S.name() << " found II=" << II
+                           << "\n");
+      return true;
+    }
+
+    // Validation failed. Try to identify a pairwise resource conflict
+    // to feed back to the solver.
+    auto Exclusion = identifyResourceConflict(Schedule);
+    if (!Exclusion) {
+      LLVM_DEBUG(dbgs() << "Solver: cannot identify resource conflict, "
+                        << "stopping retries\n");
+      return false;
+    }
+
+    DEBUG_SUMMARY(dbgs() << "Solver: retry " << (Attempt + 1) << "/"
+                         << SolverRetries << " excluding cycle(SU"
+                         << Exclusion->InstrB << ") - cycle(SU"
+                         << Exclusion->InstrA
+                         << ") == " << Exclusion->CycleDelta << "\n");
+    Solver.genResourceExclusion(*Exclusion);
   }
 
   return false;
