@@ -750,7 +750,7 @@ void dumpGraph(const ScheduleInfo &Info, ScheduleDAGInstrs *DAG) {
     for (const SDep &Dep : SU.Succs) {
       const SUnit *Succ = Dep.getSUnit();
       const int S = Succ->NodeNum;
-      if (S > Info.NInstr || S % Info.NInstr == K || Succ->isBoundaryNode()) {
+      if (S >= Info.NInstr || S % Info.NInstr == K || Succ->isBoundaryNode()) {
         continue;
       }
       dbgs() << "\tSU" << K << " -> SU" << S << " " << edgeAttributes(Dep, TRI)
