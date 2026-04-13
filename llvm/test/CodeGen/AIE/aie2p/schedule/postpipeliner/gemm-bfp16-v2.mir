@@ -34,8 +34,8 @@
   ; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
   ; CHECK-NEXT:    vlda.conv.fp32.bf16 cmh4, [p7, #64]; vldb x0, [p6, #64]; vconv.bfp16ebs8.fp32 ex5, dm4; nopx ; mov p5, p6; vmul.f dm4, y0, y5, r2
   ; CHECK-NEXT:    padda [p5], m4; vldb.3d x6, [p6], d0; nops ; nopx ; mov p3, p7; nopv
-  ; CHECK-NEXT:    vlda.3d.conv.fp32.bf16 cml4, [p7], d1; vldb x2, [p5, #0]; nops ; nopxm ; nopv
-  ; CHECK-NEXT:    nopa ; vldb x4, [p5, #64]; nopxm
+  ; CHECK-NEXT:    vlda.3d.conv.fp32.bf16 cml4, [p7], d1; vldb x2, [p5, #0]; nopx
+  ; CHECK-NEXT:    vldb x4, [p5, #64]
   ; CHECK-NEXT:    paddb [p3], m5; vconv.bfp16ebs8.fp32 ex7, dm4
   ; CHECK-NEXT:    vlda.conv.fp32.bf16 cml4, [p3, #0]
   ; CHECK-NEXT:    vlda.conv.fp32.bf16 cmh4, [p3, #64]; vconv.bfp16ebs8.fp32 ex7, dm4

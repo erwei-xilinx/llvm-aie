@@ -51,9 +51,9 @@ body:             |
 
   bb.1.loop (align 16):
     successors: %bb.1, %bb.2
-    liveins: $p0, $p7
+    liveins: $p0, $p7, $cmh4
     
-    ; Define only low half of dm4 (cmh4 is live-in, unmanaged)
+    ; Define only low half of dm4 (cmh4 is explicitly live-in, unmanaged)
     $cml4 = VLDA_CONV_fp32_bf16_dmx_lda_ups_bf_idx_imm $p7, 0 :: (load (<32 x s16>))
     
     ; Use composite register dm4 (but cmh4 was not defined in this block)
