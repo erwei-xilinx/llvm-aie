@@ -29,6 +29,7 @@
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/MC/LaneBitmask.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
@@ -97,8 +98,254 @@ void RegLiveRange::addUse(MachineOperand *UseOp, unsigned SubRegIdx) {
   Uses.emplace_back(UseOp, SubRegIdx);
 }
 
-/// Get the sub-register index if AccessReg is a sub-register of BaseReg
-/// Returns 0 if AccessReg is not a sub-register of BaseReg
+void RegLiveRange::mergeFrom(const RegLiveRange &Other,
+                             const TargetRegisterInfo *TRI) {
+  // Helper to compute sub-register index.
+  auto GetSubRegIdx = [TRI](MCRegister AccessReg,
+                            MCRegister NewBaseReg) -> unsigned {
+    if (AccessReg == NewBaseReg)
+      return 0;
+    for (MCSubRegIndexIterator SubRegIdxIt(NewBaseReg, TRI);
+         SubRegIdxIt.isValid(); ++SubRegIdxIt) {
+      if (SubRegIdxIt.getSubReg() == AccessReg) {
+        return SubRegIdxIt.getSubRegIndex();
+      }
+    }
+    return 0;
+  };
+
+  // Helper to check if Reg1 is a sub-register of Reg2 (Reg2 is larger).
+  auto IsSubReg = [TRI](MCRegister Reg1, MCRegister Reg2) -> bool {
+    for (MCSubRegIndexIterator SubRegIdxIt(Reg2, TRI); SubRegIdxIt.isValid();
+         ++SubRegIdxIt) {
+      if (SubRegIdxIt.getSubReg() == Reg1) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Helper to check if a candidate register contains all operand registers.
+  // A register R "contains" an operand register OR if OR == R or OR is a
+  // sub-register of R.
+  auto ContainsAllOperands =
+      [&IsSubReg](MCRegister Candidate,
+                  ArrayRef<MCRegister> OperandRegs) -> bool {
+    for (MCRegister OpReg : OperandRegs) {
+      if (OpReg != Candidate && !IsSubReg(OpReg, Candidate)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // Collect all operand registers from both ranges.
+  SmallVector<MCRegister, 8> AllOperandRegs;
+  for (const auto &DefInfo : Defs) {
+    AllOperandRegs.push_back(DefInfo.getOperand()->getReg().asMCReg());
+  }
+  for (const auto &UseInfo : Uses) {
+    AllOperandRegs.push_back(UseInfo.getOperand()->getReg().asMCReg());
+  }
+  for (const auto &DefInfo : Other.Defs) {
+    AllOperandRegs.push_back(DefInfo.getOperand()->getReg().asMCReg());
+  }
+  for (const auto &UseInfo : Other.Uses) {
+    AllOperandRegs.push_back(UseInfo.getOperand()->getReg().asMCReg());
+  }
+
+  // Compute the new base register: the smallest register that contains all
+  // operand registers. Start with the current base registers as candidates.
+  MCRegister NewBaseReg = BaseReg;
+  if (NewBaseReg == MCRegister::NoRegister) {
+    NewBaseReg = Other.BaseReg;
+  } else if (Other.BaseReg != MCRegister::NoRegister) {
+    // Check if we need to update to a larger base register.
+    if (IsSubReg(NewBaseReg, Other.BaseReg)) {
+      NewBaseReg = Other.BaseReg;
+    }
+  }
+
+  // If the current NewBaseReg doesn't contain all operands (e.g., sibling
+  // registers like cml4 and cmh4), find the smallest common super-register.
+  if (NewBaseReg != MCRegister::NoRegister &&
+      !ContainsAllOperands(NewBaseReg, AllOperandRegs)) {
+    // Search for the smallest super-register that contains all operands.
+    // We iterate through super-registers of NewBaseReg in ascending order
+    // (MCSuperRegIterator yields them from smallest to largest).
+    for (MCSuperRegIterator SuperIt(NewBaseReg, TRI); SuperIt.isValid();
+         ++SuperIt) {
+      if (ContainsAllOperands(*SuperIt, AllOperandRegs)) {
+        NewBaseReg = *SuperIt;
+        break;
+      }
+    }
+  }
+
+  // Re-add existing operands with updated sub-register indices if base
+  // changed.
+  if (NewBaseReg != BaseReg) {
+    SmallVector<RegOperandInfo, 4> OldDefs = std::move(Defs);
+    SmallVector<RegOperandInfo, 4> OldUses = std::move(Uses);
+    Defs.clear();
+    Uses.clear();
+
+    for (const auto &DefInfo : OldDefs) {
+      const MCRegister DefReg = DefInfo.getOperand()->getReg().asMCReg();
+      Defs.emplace_back(DefInfo.getOperand(), GetSubRegIdx(DefReg, NewBaseReg));
+    }
+    for (const auto &UseInfo : OldUses) {
+      const MCRegister UseReg = UseInfo.getOperand()->getReg().asMCReg();
+      Uses.emplace_back(UseInfo.getOperand(), GetSubRegIdx(UseReg, NewBaseReg));
+    }
+
+    BaseReg = NewBaseReg;
+  }
+
+  // Merge defs from Other with computed sub-register indices.
+  for (const auto &DefInfo : Other.defs()) {
+    const MCRegister DefReg = DefInfo.getOperand()->getReg().asMCReg();
+    Defs.emplace_back(DefInfo.getOperand(), GetSubRegIdx(DefReg, NewBaseReg));
+  }
+
+  // Merge uses from Other with computed sub-register indices.
+  for (const auto &UseInfo : Other.uses()) {
+    const MCRegister UseReg = UseInfo.getOperand()->getReg().asMCReg();
+    Uses.emplace_back(UseInfo.getOperand(), GetSubRegIdx(UseReg, NewBaseReg));
+  }
+
+  // Propagate reserved status: if Other is reserved, this becomes reserved.
+  if (Other.IsReserved) {
+    IsReserved = true;
+  }
+}
+
+void RegLiveRange::expandBaseToInclude(MCRegister ExtReg,
+                                       const TargetRegisterInfo *TRI) {
+  if (ExtReg == MCRegister::NoRegister)
+    return;
+
+  // Helper to compute sub-register index.
+  auto GetSubRegIdx = [TRI](MCRegister AccessReg,
+                            MCRegister NewBaseReg) -> unsigned {
+    if (AccessReg == NewBaseReg)
+      return 0;
+    for (MCSubRegIndexIterator SubRegIdxIt(NewBaseReg, TRI);
+         SubRegIdxIt.isValid(); ++SubRegIdxIt) {
+      if (SubRegIdxIt.getSubReg() == AccessReg) {
+        return SubRegIdxIt.getSubRegIndex();
+      }
+    }
+    return 0;
+  };
+
+  // Helper to check if Reg1 is a sub-register of Reg2 (Reg2 is larger).
+  auto IsSubReg = [TRI](MCRegister Reg1, MCRegister Reg2) -> bool {
+    for (MCSubRegIndexIterator SubRegIdxIt(Reg2, TRI); SubRegIdxIt.isValid();
+         ++SubRegIdxIt) {
+      if (SubRegIdxIt.getSubReg() == Reg1) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // If BaseReg is not set, just use ExtReg.
+  if (BaseReg == MCRegister::NoRegister) {
+    BaseReg = ExtReg;
+    return;
+  }
+
+  // If ExtReg is already contained by BaseReg, nothing to do.
+  if (ExtReg == BaseReg || IsSubReg(ExtReg, BaseReg))
+    return;
+
+  // If BaseReg is contained by ExtReg, upgrade to ExtReg.
+  if (IsSubReg(BaseReg, ExtReg)) {
+    // Recompute SubRegIdx for existing operands.
+    SmallVector<RegOperandInfo, 4> OldDefs = std::move(Defs);
+    SmallVector<RegOperandInfo, 4> OldUses = std::move(Uses);
+    Defs.clear();
+    Uses.clear();
+
+    for (const auto &DefInfo : OldDefs) {
+      const MCRegister DefReg = DefInfo.getOperand()->getReg().asMCReg();
+      Defs.emplace_back(DefInfo.getOperand(), GetSubRegIdx(DefReg, ExtReg));
+    }
+    for (const auto &UseInfo : OldUses) {
+      const MCRegister UseReg = UseInfo.getOperand()->getReg().asMCReg();
+      Uses.emplace_back(UseInfo.getOperand(), GetSubRegIdx(UseReg, ExtReg));
+    }
+
+    BaseReg = ExtReg;
+    return;
+  }
+
+  // Neither is a subreg of the other - find the smallest common super-register.
+  // Collect all operand registers plus ExtReg.
+  SmallVector<MCRegister, 8> AllRegs;
+  AllRegs.push_back(ExtReg);
+  for (const auto &DefInfo : Defs) {
+    AllRegs.push_back(DefInfo.getOperand()->getReg().asMCReg());
+  }
+  for (const auto &UseInfo : Uses) {
+    AllRegs.push_back(UseInfo.getOperand()->getReg().asMCReg());
+  }
+
+  // Helper to check if a candidate register contains all registers.
+  auto ContainsAll = [&IsSubReg](MCRegister Candidate,
+                                 ArrayRef<MCRegister> Regs) -> bool {
+    for (MCRegister R : Regs) {
+      if (R != Candidate && !IsSubReg(R, Candidate)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // Search for the smallest super-register that contains all.
+  MCRegister NewBaseReg = BaseReg;
+  for (MCSuperRegIterator SuperIt(BaseReg, TRI); SuperIt.isValid(); ++SuperIt) {
+    if (ContainsAll(*SuperIt, AllRegs)) {
+      NewBaseReg = *SuperIt;
+      break;
+    }
+  }
+
+  // Recompute SubRegIdx for existing operands.
+  if (NewBaseReg != BaseReg) {
+    SmallVector<RegOperandInfo, 4> OldDefs = std::move(Defs);
+    SmallVector<RegOperandInfo, 4> OldUses = std::move(Uses);
+    Defs.clear();
+    Uses.clear();
+
+    for (const auto &DefInfo : OldDefs) {
+      const MCRegister DefReg = DefInfo.getOperand()->getReg().asMCReg();
+      Defs.emplace_back(DefInfo.getOperand(), GetSubRegIdx(DefReg, NewBaseReg));
+    }
+    for (const auto &UseInfo : OldUses) {
+      const MCRegister UseReg = UseInfo.getOperand()->getReg().asMCReg();
+      Uses.emplace_back(UseInfo.getOperand(), GetSubRegIdx(UseReg, NewBaseReg));
+    }
+
+    BaseReg = NewBaseReg;
+  }
+}
+
+void RegLiveRange::clear() {
+  Defs.clear();
+  Uses.clear();
+  BaseReg = MCRegister::NoRegister;
+  RegisterClass = nullptr;
+  AdmissibleRegs.clear();
+  VReg = Register();
+  IsScarce = false;
+  IsReserved = false;
+  ID = -1;
+}
+
+/// Get the sub-register index if AccessReg is a sub-register of BaseReg.
+/// Returns 0 if AccessReg is not a sub-register of BaseReg.
 unsigned RegLiveRangeTracker::getSubRegIndex(MCRegister AccessReg,
                                              MCRegister BaseReg) const {
   if (AccessReg == BaseReg)
@@ -124,43 +371,43 @@ bool RegLiveRangeTracker::overlapsAnyInSet(
   return false;
 }
 
-bool RegLiveRangeTracker::startsWithDefInBlock(const RegLiveRange &LR) const {
-  if (LR.getNumDefs() == 0)
-    return false;
-
-  // Find the earliest instruction index among all operands
-  unsigned EarliestIdx = UINT_MAX;
-  bool EarliestIsDef = false;
-
-  for (const auto &Def : LR.defs()) {
-    const MachineInstr *MI = Def.getOperand()->getParent();
-    const auto It = InstrOrder.find(MI);
-    if (It != InstrOrder.end() && It->second < EarliestIdx) {
-      EarliestIdx = It->second;
-      EarliestIsDef = true;
-    }
-  }
-
-  for (const auto &Use : LR.uses()) {
-    const MachineInstr *MI = Use.getOperand()->getParent();
-    const auto It = InstrOrder.find(MI);
-    if (It != InstrOrder.end() && It->second < EarliestIdx) {
-      EarliestIdx = It->second;
-      EarliestIsDef = false;
-    }
-  }
-
-  return EarliestIsDef;
-}
-
 bool RegLiveRangeTracker::isFullyDefined(
-    const RegLiveRange &LR, const DenseMap<MCRegister, int> &LiveRegs) const {
-  // A live range is fully defined if its base register does not overlap
-  // with any register still in LiveRegs. If it overlaps, it means some
-  // part of the register is still live from before the block (incomplete def).
-  return !llvm::any_of(LiveRegs, [&](const auto &Entry) {
-    return TRI->regsOverlap(LR.BaseReg, Entry.first);
-  });
+    const RegLiveRange &LR,
+    const DenseMap<MCRegister, LaneBitmask> &LocalLiveLaneMasks,
+    const MachineBasicBlock &MBB) const {
+  // A live range is fully defined if its algorithm-local live lanemasks
+  // do not intersect with the live-in set of the block.
+  //
+  // This is more precise than just checking register overlap: it allows
+  // ranges where the live lanes are disjoint from the live-in lanes.
+  //
+  // Importantly, this can discriminate between a truly undefined register
+  // (which is not in the live-in set and is safe to virtualize) and a
+  // register that was defined outside of the loop (which is in the live-in
+  // set and should be rejected because changing it would affect loop-carried
+  // values).
+
+  // Check each register in LocalLiveLaneMasks that overlaps with the base
+  // register.
+  for (const auto &[LiveReg, LocalLanes] : LocalLiveLaneMasks) {
+    if (!TRI->regsOverlap(LR.getBaseReg(), LiveReg))
+      continue;
+
+    // Found an overlapping register with non-zero live lanes.
+    // Check if these lanes intersect with the live-in set.
+    for (const auto &LiveIn : MBB.liveins()) {
+      if (!TRI->regsOverlap(LiveReg, LiveIn.PhysReg))
+        continue;
+
+      // Check if the algorithm-local live lanes intersect with the live-in
+      // lanes.
+      if ((LocalLanes & LiveIn.LaneMask).any()) {
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
 bool RegLiveRangeTracker::hasTiedOperands(const RegLiveRange &LR) const {
@@ -318,192 +565,207 @@ void RegLiveRangeTracker::pruneByFullCoverage() {
 }
 
 void RegLiveRangeTracker::mergeAliasingLiveRanges(
-    unsigned DefLRIdx, MCRegister DefReg, DenseMap<MCRegister, int> &LiveRegs,
+    unsigned DefLRIdx, MCRegister DefReg,
+    DenseMap<MCRegister, std::pair<int, LaneBitmask>> &LiveRegs,
     DenseMap<MachineOperand *, unsigned> &OperandToLiveRange) {
 
-  // Collect all aliasing live registers and their live ranges
+  // Helper to check if a def register's lanes overlap with a live register's
+  // current lanes. This is critical for separating live ranges: after x10 is
+  // defined, any y5 (containing x10) should only have x11's lanes live, and a
+  // subsequent x10 def should NOT merge into that y5 range.
+  auto LanesOverlap = [this](MCRegister DefR, MCRegister LiveR,
+                             LaneBitmask LiveLanes) -> bool {
+    // If registers are equal, check if any lanes are live.
+    if (DefR == LiveR)
+      return LiveLanes.any();
+
+    // Check if DefR is a subreg of LiveR.
+    for (MCSubRegIndexIterator SubIdxIt(LiveR, TRI); SubIdxIt.isValid();
+         ++SubIdxIt) {
+      if (SubIdxIt.getSubReg() == DefR) {
+        // DefR is a subreg of LiveR - check if DefR's lanes are live.
+        const LaneBitmask DefLanes =
+            TRI->getSubRegIndexLaneMask(SubIdxIt.getSubRegIndex());
+        return (LiveLanes & DefLanes).any();
+      }
+    }
+
+    // Check if LiveR is a subreg of DefR.
+    for (MCSubRegIndexIterator SubIdxIt(DefR, TRI); SubIdxIt.isValid();
+         ++SubIdxIt) {
+      if (SubIdxIt.getSubReg() == LiveR) {
+        // LiveR is a subreg of DefR - if any lanes of LiveR are live,
+        // they overlap with DefR.
+        return LiveLanes.any();
+      }
+    }
+
+    // Registers overlap but no subreg relationship - conservatively treat
+    // as overlapping if any lanes are live.
+    return LiveLanes.any();
+  };
+
+  // Collect all aliasing live registers and their live ranges.
+  // Only include registers where the lanes actually overlap.
   SmallVector<std::pair<MCRegister, int>, 8> AliasingLiveRegs;
-  for (const auto &[LiveReg, LiveLRIdx] : LiveRegs) {
-    if (TRI->regsOverlap(DefReg, LiveReg)) {
-      AliasingLiveRegs.push_back({LiveReg, LiveLRIdx});
+  for (const auto &[LiveReg, Info] : LiveRegs) {
+    if (TRI->regsOverlap(DefReg, LiveReg) &&
+        LanesOverlap(DefReg, LiveReg, Info.second)) {
+      AliasingLiveRegs.push_back({LiveReg, Info.first});
     }
   }
 
   if (AliasingLiveRegs.empty())
     return;
 
-  // Collect all unique live range indices to merge (including the def's).
-  // Skip NoLiveRange sentinels as they don't have actual ranges yet.
-  DenseSet<unsigned> ToMerge;
-  ToMerge.insert(DefLRIdx);
+  // Collect all unique live range indices to merge (excluding NoLiveRange
+  // sentinels which represent live-out registers without actual ranges).
+  SmallVector<unsigned, 4> ToMerge;
   for (const auto &[LiveReg, LRIdx] : AliasingLiveRegs) {
     if (LRIdx != RegLiveRange::NoLiveRange) {
-      ToMerge.insert(static_cast<unsigned>(LRIdx));
+      // Check if we already have this index.
+      if (llvm::find(ToMerge, static_cast<unsigned>(LRIdx)) == ToMerge.end() &&
+          static_cast<unsigned>(LRIdx) != DefLRIdx) {
+        ToMerge.push_back(static_cast<unsigned>(LRIdx));
+      }
     }
   }
 
-  // Find the base register (largest among all involved registers)
-  MCRegister BaseReg = DefReg;
+  // Compute reserved status before merging.
+  // Check if any aliasing live register is a live-out sentinel.
+  bool IsReservedFromLiveOut = false;
   for (const auto &[LiveReg, LRIdx] : AliasingLiveRegs) {
-    if (getSubRegIndex(BaseReg, LiveReg) != 0) {
-      // LiveReg is larger than current base
-      BaseReg = LiveReg;
-    }
-  }
-
-  // Use DefLRIdx as the target for merging
-  const unsigned MergedLRIdx = DefLRIdx;
-  LiveRanges[MergedLRIdx].BaseReg = BaseReg;
-
-  // Rebuild the def's live range with correct SubRegIdx
-  RegLiveRange NewMergedLR;
-  NewMergedLR.ID = LiveRanges[MergedLRIdx].ID; // Preserve the ID
-  NewMergedLR.BaseReg = BaseReg;
-  NewMergedLR.RegisterClass = LiveRanges[MergedLRIdx].RegisterClass;
-
-  // Propagate reserved status: if any merged range is reserved, the result is
-  // reserved.
-  bool IsReserved = LiveRanges[MergedLRIdx].isReserved();
-  for (const auto &[LiveReg, LRIdx] : AliasingLiveRegs) {
-    if (LRIdx != RegLiveRange::NoLiveRange && LiveRanges[LRIdx].isReserved()) {
-      IsReserved = true;
+    if (LRIdx == RegLiveRange::NoLiveRange) {
+      IsReservedFromLiveOut = true;
       break;
     }
   }
 
-  // Also check if any subreg of the merged base register is live-out.
-  // Live-out registers are marked with NoLiveRange sentinel in LiveRegs.
-  if (!IsReserved) {
-    for (MCSubRegIterator SubIt(BaseReg, TRI, /*IncludeSelf=*/true);
+  // Also check if any subreg of DefReg is live-out.
+  if (!IsReservedFromLiveOut) {
+    for (MCSubRegIterator SubIt(DefReg, TRI, /*IncludeSelf=*/true);
          SubIt.isValid(); ++SubIt) {
       auto It = LiveRegs.find(*SubIt);
-      if (It != LiveRegs.end() && It->second == RegLiveRange::NoLiveRange) {
-        IsReserved = true;
+      if (It != LiveRegs.end() &&
+          It->second.first == RegLiveRange::NoLiveRange) {
+        IsReservedFromLiveOut = true;
         break;
       }
     }
   }
 
-  NewMergedLR.setIsReserved(IsReserved);
-  for (const auto &DefInfo : LiveRanges[MergedLRIdx].defs()) {
-    const MCRegister DefRegister = DefInfo.getOperand()->getReg().asMCReg();
-    NewMergedLR.addDef(DefInfo.getOperand(),
-                       getSubRegIndex(DefRegister, BaseReg));
-  }
-  for (const auto &UseInfo : LiveRanges[MergedLRIdx].uses()) {
-    const MCRegister UseReg = UseInfo.getOperand()->getReg().asMCReg();
-    NewMergedLR.addUse(UseInfo.getOperand(), getSubRegIndex(UseReg, BaseReg));
+  // Get the target live range and update its reserved status.
+  RegLiveRange &TargetLR = LiveRanges[DefLRIdx];
+  if (IsReservedFromLiveOut) {
+    TargetLR.setIsReserved(true);
   }
 
-  // Merge all other live ranges into the new merged range
+  // Expand TargetLR's base to include any external registers from
+  // AliasingLiveRegs that don't have actual live ranges (live-out sentinels).
+  // These registers affect the base register size but have no operands.
+  for (const auto &[LiveReg, LRIdx] : AliasingLiveRegs) {
+    if (LRIdx == RegLiveRange::NoLiveRange) {
+      TargetLR.expandBaseToInclude(LiveReg, TRI);
+    }
+  }
+
+  // Incrementally merge all other live ranges into the target.
+  // The enhanced mergeFrom() automatically computes the smallest common
+  // super-register that contains all operands from both ranges.
   for (unsigned LRIdx : ToMerge) {
-    if (LRIdx != MergedLRIdx) {
-      // Add all operands from this range with correct SubRegIdx
-      for (const auto &DefInfo : LiveRanges[LRIdx].defs()) {
-        const MCRegister DefRegister = DefInfo.getOperand()->getReg().asMCReg();
-        NewMergedLR.addDef(DefInfo.getOperand(),
-                           getSubRegIndex(DefRegister, BaseReg));
-      }
-      for (const auto &UseInfo : LiveRanges[LRIdx].uses()) {
-        const MCRegister UseReg = UseInfo.getOperand()->getReg().asMCReg();
-        NewMergedLR.addUse(UseInfo.getOperand(),
-                           getSubRegIndex(UseReg, BaseReg));
-      }
+    TargetLR.mergeFrom(LiveRanges[LRIdx], TRI);
 
-      // Clear the merged range
-      LiveRanges[LRIdx] = RegLiveRange();
+    // Clear the source range (mark as invalid).
+    LiveRanges[LRIdx].clear();
 
-      // Update all LiveRegs entries that pointed to the merged range
-      for (auto &[LiveReg, LiveLRIdx] : LiveRegs) {
-        if (LiveLRIdx == static_cast<int>(LRIdx)) {
-          LiveLRIdx = static_cast<int>(MergedLRIdx);
-        }
+    // Update all LiveRegs entries that pointed to the merged range.
+    for (auto &[LiveReg, Info] : LiveRegs) {
+      if (Info.first == static_cast<int>(LRIdx)) {
+        Info.first = static_cast<int>(DefLRIdx);
       }
+    }
 
-      // Update OperandToLiveRange
-      for (auto &Entry : OperandToLiveRange) {
-        if (Entry.second == LRIdx) {
-          Entry.second = MergedLRIdx;
-        }
+    // Update OperandToLiveRange.
+    for (auto &Entry : OperandToLiveRange) {
+      if (Entry.second == LRIdx) {
+        Entry.second = DefLRIdx;
       }
     }
   }
 
-  // Replace the merged live range with the new one
-  LiveRanges[MergedLRIdx] = std::move(NewMergedLR);
-
-  // Remove fully redefined registers from LiveRegs
-  for (auto &[LiveReg, _] : AliasingLiveRegs) {
+  // Remove fully redefined registers from LiveRegs.
+  for (const auto &[LiveReg, LRIdx] : AliasingLiveRegs) {
     if (DefReg == LiveReg || getSubRegIndex(LiveReg, DefReg) != 0) {
       LiveRegs.erase(LiveReg);
     }
   }
 
-  // Also check if this def, combined with other defs in the merged range,
+  // Update lane masks for partially redefined super-registers.
+  // When DefReg is a subreg of LiveReg, the def kills DefReg's lanes within
+  // LiveReg. This is critical for separating live ranges: after x10 is defined,
+  // any y5 (containing x10) should only have x11's lanes live, not x10's.
+  for (const auto &[LiveReg, OrigLRIdx] : AliasingLiveRegs) {
+    // Skip if already erased (fully redefined).
+    auto LiveIt = LiveRegs.find(LiveReg);
+    if (LiveIt == LiveRegs.end())
+      continue;
+
+    // Check if DefReg is a subreg of LiveReg (DefReg partially kills LiveReg).
+    const unsigned SubRegIdx = getSubRegIndex(DefReg, LiveReg);
+    if (SubRegIdx != 0) {
+      // DefReg is a subreg of LiveReg - update LiveReg's lane mask.
+      const LaneBitmask DefLanes = TRI->getSubRegIndexLaneMask(SubRegIdx);
+      LiveIt->second.second &= ~DefLanes;
+
+      // If no lanes remain live, remove the entry entirely.
+      if (LiveIt->second.second.none()) {
+        LiveRegs.erase(LiveIt);
+      }
+    }
+  }
+
+  // Check if this def, combined with other defs in the merged range,
   // fully defines a super-register. If so, remove the super-register from
   // LiveRegs.
-  if (MergedLRIdx < LiveRanges.size()) {
-    RegLiveRange &MergedLR = LiveRanges[MergedLRIdx];
-    const MCRegister MergedBaseReg = LiveRanges[MergedLRIdx].BaseReg;
+  const MCRegister MergedBaseReg = TargetLR.getBaseReg();
 
-    // Collect all defined sub-registers and compute their combined lane mask
-    LaneBitmask DefinedLanes = LaneBitmask::getNone();
-    for (const auto &DefInfo : MergedLR.defs()) {
-      const MCRegister DefRegister = DefInfo.getOperand()->getReg().asMCReg();
-      if (DefRegister == MergedBaseReg) {
-        // Full register defined - covers all lanes
-        DefinedLanes = LaneBitmask::getAll();
-        break;
-      }
-      const unsigned SubIdx = getSubRegIndex(DefRegister, MergedBaseReg);
-      if (SubIdx != 0) {
-        // Add this sub-register's lanes to the defined lanes
-        DefinedLanes |= TRI->getSubRegIndexLaneMask(SubIdx);
+  // Collect all defined sub-registers.
+  DenseSet<MCRegister> AllDefinedRegs;
+  for (const auto &DefInfo : TargetLR.defs()) {
+    const MCRegister DefRegister = DefInfo.getOperand()->getReg().asMCReg();
+    AllDefinedRegs.insert(DefRegister);
+    // Also add all sub-registers of this defined register.
+    for (MCSubRegIterator SubIt(DefRegister, TRI, /*IncludeSelf=*/false);
+         SubIt.isValid(); ++SubIt) {
+      AllDefinedRegs.insert(*SubIt);
+    }
+  }
+
+  // Check if all sub-registers of a register are defined.
+  auto FullyCovered = [&](MCRegister Reg) {
+    for (MCSubRegIterator SubIt(Reg, TRI, /*IncludeSelf=*/false);
+         SubIt.isValid(); ++SubIt) {
+      if (!AllDefinedRegs.count(*SubIt)) {
+        return false;
       }
     }
+    return true;
+  };
 
-    // Check if the defined sub-registers fully cover any super-register
-    // We need to recursively collect all sub-registers that are defined
-    DenseSet<MCRegister> AllDefinedRegs;
-    for (const auto &DefInfo : MergedLR.defs()) {
-      const MCRegister DefRegister = DefInfo.getOperand()->getReg().asMCReg();
-      AllDefinedRegs.insert(DefRegister);
-      // Also add all sub-registers of this defined register
-      for (MCSubRegIterator SubIt(DefRegister, TRI, /*IncludeSelf=*/false);
-           SubIt.isValid(); ++SubIt) {
-        AllDefinedRegs.insert(*SubIt);
-      }
-    }
+  // Check BaseReg and its super-registers.
+  SmallVector<MCRegister, 4> RegsToCheck;
+  RegsToCheck.push_back(MergedBaseReg);
+  for (MCSuperRegIterator SuperIt(MergedBaseReg, TRI); SuperIt.isValid();
+       ++SuperIt) {
+    RegsToCheck.push_back(*SuperIt);
+  }
 
-    // Now check if any super-register of BaseReg is fully covered
-    // Start with BaseReg itself and check all its super-registers
-    SmallVector<MCRegister, 4> RegsToCheck;
-    RegsToCheck.push_back(MergedBaseReg);
-    for (MCSuperRegIterator SuperIt(MergedBaseReg, TRI); SuperIt.isValid();
-         ++SuperIt) {
-      RegsToCheck.push_back(*SuperIt);
-    }
-
-    // Check if all sub-registers of Reg are in AllDefinedRegs
-    auto FullyCovered = [&](MCRegister Reg) {
-      for (MCSubRegIterator SubIt(Reg, TRI, /*IncludeSelf=*/false);
-           SubIt.isValid(); ++SubIt) {
-        if (!AllDefinedRegs.count(*SubIt)) {
-          return false;
-        }
-      }
-      return true;
-    };
-
-    for (const MCRegister CheckReg : RegsToCheck) {
-      // If this register is fully covered, remove it from LiveRegs
-      if (FullyCovered(CheckReg)) {
-        LiveRegs.erase(CheckReg);
-        // Also remove any super-registers of CheckReg
-        for (MCSuperRegIterator SuperIt(CheckReg, TRI); SuperIt.isValid();
-             ++SuperIt) {
-          LiveRegs.erase(*SuperIt);
-        }
+  for (const MCRegister CheckReg : RegsToCheck) {
+    if (FullyCovered(CheckReg)) {
+      LiveRegs.erase(CheckReg);
+      for (MCSuperRegIterator SuperIt(CheckReg, TRI); SuperIt.isValid();
+           ++SuperIt) {
+        LiveRegs.erase(*SuperIt);
       }
     }
   }
@@ -513,7 +775,7 @@ DenseSet<MCRegister> RegLiveRangeTracker::collectReservedBaseRegs() const {
   DenseSet<MCRegister> ReservedRegs;
   for (const RegLiveRange &LR : LiveRanges) {
     if (LR.isReserved()) {
-      ReservedRegs.insert(LR.BaseReg);
+      ReservedRegs.insert(LR.getBaseReg());
     }
   }
   return ReservedRegs;
@@ -533,10 +795,12 @@ void RegLiveRangeTracker::computeAvailableFromLiveRanges(
   // register that overlaps with a reserved register.
   AvailablePhysRegs.clear();
   for (const RegLiveRange &LR : LiveRanges) {
-    assert(LR.RegisterClass && "Live range must have a valid register class");
-    assert(LR.BaseReg != MCRegister::NoRegister &&
+    assert(LR.getRegisterClass() &&
+           "Live range must have a valid register class");
+    assert(LR.getBaseReg() != MCRegister::NoRegister &&
            "Live range must have a base register");
-    assert(LR.BaseReg.isPhysical() && "BaseReg must be a physical register");
+    assert(LR.getBaseReg().isPhysical() &&
+           "BaseReg must be a physical register");
 
     // Skip if this range is reserved.
     if (LR.isReserved()) {
@@ -546,13 +810,13 @@ void RegLiveRangeTracker::computeAvailableFromLiveRanges(
     // Skip if base register overlaps with any reserved register.
     // Sub-registers are contained within the base, so if the base doesn't
     // overlap with reserved, neither will any sub-register.
-    if (OverlapsReserved(LR.BaseReg)) {
+    if (OverlapsReserved(LR.getBaseReg())) {
       continue;
     }
 
     // Add base register and all its sub-registers.
-    AvailablePhysRegs.insert(LR.BaseReg);
-    for (MCSubRegIterator SubIt(LR.BaseReg, TRI, /*IncludeSelf=*/false);
+    AvailablePhysRegs.insert(LR.getBaseReg());
+    for (MCSubRegIterator SubIt(LR.getBaseReg(), TRI, /*IncludeSelf=*/false);
          SubIt.isValid(); ++SubIt) {
       AvailablePhysRegs.insert(*SubIt);
     }
@@ -619,8 +883,8 @@ void RegLiveRangeTracker::addUnusedCallerSavedRegs(
   // Collect the set of register classes used by live ranges.
   SmallPtrSet<const TargetRegisterClass *, 8> UsedRegClasses;
   for (const RegLiveRange &LR : LiveRanges) {
-    if (LR.RegisterClass) {
-      UsedRegClasses.insert(LR.RegisterClass);
+    if (LR.getRegisterClass()) {
+      UsedRegClasses.insert(LR.getRegisterClass());
     }
   }
 
@@ -737,15 +1001,12 @@ void RegLiveRangeTracker::markScarceRanges() {
   }
 }
 
-void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
-                                  ArrayRef<MachineInstr *> SemanticOrder) {
-  assert(!SemanticOrder.empty() && "SemanticOrder must be provided - MBB order "
-                                   "is unreliable after scheduling");
-  clear();
+//===----------------------------------------------------------------------===//
+// Analyze helper methods (decomposition of analyze())
+//===----------------------------------------------------------------------===//
 
-  // Build instruction order map from semantic order
-  // Also track implicit registers to invalidate overlapping explicit ranges
-  DenseSet<MCRegister> ImplicitRegs;
+void RegLiveRangeTracker::buildInstructionOrderAndCollectOperands(
+    ArrayRef<MachineInstr *> SemanticOrder, LivenessScanState &State) {
   unsigned InstrIdx = 0;
   for (MachineInstr *MI : SemanticOrder) {
     InstrOrder[MI] = InstrIdx++;
@@ -756,141 +1017,185 @@ void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
       }
       if (MO.isImplicit()) {
         // Track implicit registers - we won't create live ranges for these
-        // but will use them to invalidate explicit ranges
+        // but will use them to invalidate explicit ranges.
         const MCRegister Reg = MO.getReg().asMCReg();
 
-        // Add all aliases
+        // Add all aliases.
         for (MCRegAliasIterator AI(Reg, TRI, /*IncludeSelf=*/true);
              AI.isValid(); ++AI) {
-          MCRegister Alias = *AI;
-          ImplicitRegs.insert(Alias);
+          State.ImplicitRegs.insert(*AI);
         }
       } else {
         AllPhysRegOperands.push_back(&MO);
       }
     }
   }
+}
 
-  // Track live registers (backward pass).
-  // Map from register to its current live range index (signed).
-  // Use NoLiveRange as sentinel for live-out registers not yet associated with
-  // a range.
-  DenseMap<MCRegister, int> LiveRegs;
-
-  // Initialize with live-out registers using NoLiveRange as sentinel.
+void RegLiveRangeTracker::initLiveRegsFromLiveOuts(const MachineBasicBlock &MBB,
+                                                   LivenessScanState &State) {
+  // Initialize with live-out registers using NoLiveRange as sentinel and their
+  // lane masks.
   for (const auto &RMP : MBB.liveouts()) {
-    LiveRegs[RMP.PhysReg] = RegLiveRange::NoLiveRange;
+    State.LiveRegs[RMP.PhysReg] = {RegLiveRange::NoLiveRange, RMP.LaneMask};
   }
+}
 
-  // Map from operand to live range index
-  DenseMap<MachineOperand *, unsigned> OperandToLiveRange;
+unsigned RegLiveRangeTracker::getOrCreateLiveRangeForOperand(
+    MCRegister Reg, MachineOperand *MO, LivenessScanState &State) {
+  bool IsReserved = false;
 
-  // Lambda to create or find a live range for a register.
-  auto GetOrCreateLiveRange = [&](MCRegister Reg,
-                                  MachineOperand *MO) -> unsigned {
-    bool IsReserved = false;
+  // Check if this register or an aliasing register is already live.
+  // We need to find an entry where the lanes actually overlap, not just
+  // the registers.  This is critical for separating live ranges: after
+  // x10 is defined, any y5 (containing x10) should only have x11's lanes
+  // live, and a subsequent x10 access should NOT merge into that y5 range.
+  auto It = llvm::find_if(State.LiveRegs, [Reg, TRI = TRI](const auto &Entry) {
+    if (!TRI->regsOverlap(Reg, Entry.first))
+      return false;
 
-    // Check if this register or an aliasing register is already live.
-    auto It = llvm::find_if(LiveRegs, [Reg, TRI = TRI](const auto &Entry) {
-      return TRI->regsOverlap(Reg, Entry.first);
-    });
+    // Registers overlap - now check if lanes overlap.
+    const MCRegister LiveReg = Entry.first;
+    const LaneBitmask LiveLanes = Entry.second.second;
 
-    if (It != LiveRegs.end()) {
-      const int LRIdx = It->second;
+    // If LiveReg equals Reg, check if any lanes are live.
+    if (LiveReg == Reg)
+      return LiveLanes.any();
 
-      if (LRIdx == RegLiveRange::NoLiveRange) {
-        // Found a live-out register (NoLiveRange sentinel).
-        // Mark the new range as reserved.
-        IsReserved = true;
-      } else {
-        // Found an aliasing live register with an actual live range.
-        assert(LRIdx >= 0 && "LRIdx must be valid");
-        OperandToLiveRange[MO] = LRIdx;
-
-        // Update base register for this live range if needed.
-        MCRegister CurrentBase = LiveRanges[LRIdx].BaseReg;
-        if (CurrentBase == MCRegister::NoRegister) {
-          // No base yet, use current register.
-          LiveRanges[LRIdx].BaseReg = Reg;
-        } else {
-          // Check if we need to update to a larger base register.
-          assert(CurrentBase.isPhysical() && "CurrentBase must be physical");
-          assert(Reg.isPhysical() && "Reg must be physical");
-          if (getSubRegIndex(Reg, CurrentBase) == 0 &&
-              getSubRegIndex(CurrentBase, Reg) != 0) {
-            // Reg is larger than current base.
-            LiveRanges[LRIdx].BaseReg = Reg;
-          }
-        }
-
-        return LRIdx;
+    // Check if Reg is a subreg of LiveReg.
+    for (MCSubRegIndexIterator SubIdxIt(LiveReg, TRI); SubIdxIt.isValid();
+         ++SubIdxIt) {
+      if (SubIdxIt.getSubReg() == Reg) {
+        // Reg is a subreg of LiveReg - check if Reg's lanes are live.
+        const LaneBitmask RegLanes =
+            TRI->getSubRegIndexLaneMask(SubIdxIt.getSubRegIndex());
+        return (LiveLanes & RegLanes).any();
       }
     }
 
-    // Create a new live range.
-    const unsigned NewLRIdx = LiveRanges.size();
-    LiveRanges.emplace_back();
-    LiveRanges[NewLRIdx].ID = NextLiveRangeID++;
-    LiveRanges[NewLRIdx].BaseReg = Reg;
-    LiveRanges[NewLRIdx].setIsReserved(IsReserved);
-    LiveRegs[Reg] = static_cast<int>(NewLRIdx);
-    OperandToLiveRange[MO] = NewLRIdx;
-    return NewLRIdx;
-  };
-
-  // Process instructions in reverse semantic order (backward pass)
-  for (MachineInstr *MI : llvm::reverse(SemanticOrder)) {
-
-    // In backward pass: process uses first (they start liveness), then defs
-    // (they kill liveness)
-
-    // First process uses - they start liveness.
-    for (MachineOperand &MO : MI->uses()) {
-      if (!MO.isReg() || !MO.getReg().isPhysical() || MO.isImplicit())
-        continue;
-
-      const MCRegister Reg = MO.getReg().asMCReg();
-      const unsigned LRIdx = GetOrCreateLiveRange(Reg, &MO);
-
-      // Add use to the live range with SubRegIdx relative to base.
-      const MCRegister CurrentBase = LiveRanges[LRIdx].BaseReg;
-      const unsigned SubRegIdx = getSubRegIndex(Reg, CurrentBase);
-      LiveRanges[LRIdx].addUse(&MO, SubRegIdx);
+    // Check if LiveReg is a subreg of Reg.
+    for (MCSubRegIndexIterator SubIdxIt(Reg, TRI); SubIdxIt.isValid();
+         ++SubIdxIt) {
+      if (SubIdxIt.getSubReg() == LiveReg) {
+        // LiveReg is a subreg of Reg - if any lanes of LiveReg are live,
+        // they overlap with Reg.
+        return LiveLanes.any();
+      }
     }
 
-    // Then process defs - they kill liveness.
-    for (MachineOperand &MO : MI->defs()) {
-      if (!MO.isReg() || !MO.getReg().isPhysical() || MO.isImplicit())
-        continue;
+    // Registers overlap but no subreg relationship - conservatively treat
+    // as overlapping if any lanes are live.
+    return LiveLanes.any();
+  });
 
-      const MCRegister Reg = MO.getReg().asMCReg();
-      const unsigned DefLRIdx = GetOrCreateLiveRange(Reg, &MO);
+  if (It != State.LiveRegs.end()) {
+    const int LRIdx = It->second.first;
 
-      // Add def to the live range with SubRegIdx relative to base.
-      const MCRegister CurrentBase = LiveRanges[DefLRIdx].BaseReg;
-      const unsigned SubRegIdx = getSubRegIndex(Reg, CurrentBase);
-      LiveRanges[DefLRIdx].addDef(&MO, SubRegIdx);
+    if (LRIdx == RegLiveRange::NoLiveRange) {
+      // Found a live-out register (NoLiveRange sentinel).
+      // Mark the new range as reserved.
+      IsReserved = true;
+    } else {
+      // Found an aliasing live register with an actual live range.
+      assert(LRIdx >= 0 && "LRIdx must be valid");
+      State.OperandToLiveRange[MO] = LRIdx;
 
-      // Merge with any aliasing live ranges.
-      mergeAliasingLiveRanges(DefLRIdx, Reg, LiveRegs, OperandToLiveRange);
+      // Update base register for this live range if needed.
+      MCRegister CurrentBase = LiveRanges[LRIdx].getBaseReg();
+      if (CurrentBase == MCRegister::NoRegister) {
+        // No base yet - expand base to include this register.
+        LiveRanges[LRIdx].expandBaseToInclude(Reg, TRI);
+      } else {
+        // Check if we need to update to a larger base register.
+        assert(CurrentBase.isPhysical() && "CurrentBase must be physical");
+        assert(Reg.isPhysical() && "Reg must be physical");
+        if (getSubRegIndex(Reg, CurrentBase) == 0 &&
+            getSubRegIndex(CurrentBase, Reg) != 0) {
+          // Reg is larger than current base - update BaseReg and recompute
+          // SubRegIdx for all existing operands.
+          LiveRanges[LRIdx].expandBaseToInclude(Reg, TRI);
+        }
+      }
+
+      return LRIdx;
     }
   }
 
-  // First-stage safety filtering
+  // Create a new live range.
+  const unsigned NewLRIdx = LiveRanges.size();
+  LiveRanges.emplace_back(NextLiveRangeID++, Reg, IsReserved);
+  State.LiveRegs[Reg] = {static_cast<int>(NewLRIdx), LaneBitmask::getAll()};
+  State.OperandToLiveRange[MO] = NewLRIdx;
+  return NewLRIdx;
+}
+
+void RegLiveRangeTracker::processDefsInInstruction(MachineInstr &MI,
+                                                   LivenessScanState &State) {
+  for (MachineOperand &MO : MI.defs()) {
+    if (!MO.isReg() || !MO.getReg().isPhysical() || MO.isImplicit())
+      continue;
+
+    const MCRegister Reg = MO.getReg().asMCReg();
+    const unsigned DefLRIdx = getOrCreateLiveRangeForOperand(Reg, &MO, State);
+
+    // Add def to the live range with SubRegIdx relative to base.
+    const MCRegister CurrentBase = LiveRanges[DefLRIdx].getBaseReg();
+    const unsigned SubRegIdx = getSubRegIndex(Reg, CurrentBase);
+    LiveRanges[DefLRIdx].addDef(&MO, SubRegIdx);
+
+    // Merge with any aliasing live ranges.
+    mergeAliasingLiveRanges(DefLRIdx, Reg, State.LiveRegs,
+                            State.OperandToLiveRange);
+  }
+}
+
+void RegLiveRangeTracker::processUsesInInstruction(MachineInstr &MI,
+                                                   LivenessScanState &State) {
+  for (MachineOperand &MO : MI.uses()) {
+    if (!MO.isReg() || !MO.getReg().isPhysical() || MO.isImplicit())
+      continue;
+
+    const MCRegister Reg = MO.getReg().asMCReg();
+    const unsigned LRIdx = getOrCreateLiveRangeForOperand(Reg, &MO, State);
+
+    // Add use to the live range with SubRegIdx relative to base.
+    const MCRegister CurrentBase = LiveRanges[LRIdx].getBaseReg();
+    const unsigned SubRegIdx = getSubRegIndex(Reg, CurrentBase);
+    LiveRanges[LRIdx].addUse(&MO, SubRegIdx);
+  }
+}
+
+void RegLiveRangeTracker::performLivenessScan(
+    ArrayRef<MachineInstr *> SemanticOrder, LivenessScanState &State) {
+  // Process instructions in reverse semantic order (backward pass).
+  for (MachineInstr *MI : llvm::reverse(SemanticOrder)) {
+    // In backward pass: process defs first (they kill liveness), then uses
+    // (they start liveness). This order is critical for read-modify-write
+    // instructions where the same register is both read and written.
+    // The def terminates the current live range, and the use starts a new one.
+    processDefsInInstruction(*MI, State);
+    processUsesInInstruction(*MI, State);
+  }
+}
+
+void RegLiveRangeTracker::applySafetyFiltering(
+    const MachineBasicBlock &MBB, const LivenessScanState &State,
+    const DenseMap<MCRegister, LaneBitmask> &LocalLiveLaneMasks) {
   LLVM_DEBUG({ dump("CANDIDATE LIVE RANGES\n"); });
   LLVM_DEBUG(dbgs() << "\nFirst-stage filtering: " << LiveRanges.size()
                     << " candidate ranges\n");
+
   SmallVector<RegLiveRange, 16> SafeRanges;
   for (const RegLiveRange &LR : LiveRanges) {
-
-    // Skip invalid/cleared ranges from merging
+    // Skip invalid/cleared ranges from merging.
     if (LR.getID() < 0)
       continue;
 
     // Filter out live ranges whose base register is not fully defined.
-    // This uses the same check as during the backward scan to determine
-    // if a new live range should be created.
-    if (!isFullyDefined(LR, LiveRegs)) {
+    // This checks that the range doesn't read from live-in values, which
+    // would make it unsafe to virtualize (we'd be changing loop-carried
+    // values). This also implicitly handles use-before-def cases.
+    if (!isFullyDefined(LR, LocalLiveLaneMasks, MBB)) {
       LLVM_DEBUG({
         dbgs() << "Reject: base register not fully defined in block: ";
         LR.dumpBrief(TRI);
@@ -898,19 +1203,10 @@ void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
       continue;
     }
 
-    // Must have at least 1 def (use-only ranges indicate live-in)
-    if (LR.getNumDefs() == 0) {
-      LLVM_DEBUG({
-        dbgs() << "Reject: no defs: ";
-        LR.dumpBrief(TRI);
-      });
-      continue;
-    }
-
-    // Filter out any live range that uses an implicit register
-    auto UsesImplicitReg = [&ImplicitRegs](const RegOperandInfo &OperInfo) {
+    // Filter out any live range that uses an implicit register.
+    auto UsesImplicitReg = [&State](const RegOperandInfo &OperInfo) {
       const MCRegister Reg = OperInfo.getOperand()->getReg().asMCReg();
-      return ImplicitRegs.count(Reg) > 0;
+      return State.ImplicitRegs.count(Reg) > 0;
     };
 
     if (llvm::any_of(LR.operands(), UsesImplicitReg)) {
@@ -918,7 +1214,7 @@ void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
         dbgs() << "Reject: uses implicit register ";
         for (const auto &OI : LR.operands()) {
           MCRegister R = OI.getOperand()->getReg().asMCReg();
-          if (ImplicitRegs.count(R)) {
+          if (State.ImplicitRegs.count(R)) {
             dbgs() << TRI->getName(R) << " ";
             break;
           }
@@ -929,16 +1225,7 @@ void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
       continue;
     }
 
-    // Must start with a def in the block (not use-before-def)
-    if (!startsWithDefInBlock(LR)) {
-      LLVM_DEBUG({
-        dbgs() << "Reject: doesn't start with def (use-before-def): ";
-        LR.dumpBrief(TRI);
-      });
-      continue;
-    }
-
-    // Reject tied operands
+    // Reject tied operands.
     if (hasTiedOperands(LR)) {
       LLVM_DEBUG({
         dbgs() << "Reject: has tied operands: ";
@@ -962,15 +1249,17 @@ void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
                     << " safe ranges\n");
 
   LiveRanges = std::move(SafeRanges);
+}
 
-  // Compute register classes and apply filtering.
+void RegLiveRangeTracker::computeRegisterClassesAndFilter() {
   LLVM_DEBUG(dbgs() << "\nRegister class computation and filtering\n");
+
   SmallVector<RegLiveRange, 16> ValidRanges;
   for (RegLiveRange &LR : LiveRanges) {
     computeRegisterClass(LR);
 
     // Filter out ranges with no valid register class.
-    if (!LR.RegisterClass) {
+    if (!LR.getRegisterClass()) {
       LLVM_DEBUG({
         dbgs() << "Reject: no valid register class: ";
         LR.dumpBrief(TRI);
@@ -980,11 +1269,11 @@ void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
 
     // Apply register class filtering if specified.
     if (!ExcludeLiveRangesByRegClass.empty() &&
-        StringRef(TRI->getRegClassName(LR.RegisterClass)) ==
+        StringRef(TRI->getRegClassName(LR.getRegisterClass())) ==
             ExcludeLiveRangesByRegClass) {
       LLVM_DEBUG({
         dbgs() << "Reject: excluded register class "
-               << TRI->getRegClassName(LR.RegisterClass) << ": ";
+               << TRI->getRegClassName(LR.getRegisterClass()) << ": ";
         LR.dumpBrief(TRI);
       });
       continue;
@@ -996,7 +1285,10 @@ void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
 
   LLVM_DEBUG(dbgs() << "After register class filtering: " << LiveRanges.size()
                     << " ranges\n");
+}
 
+void RegLiveRangeTracker::finalizeAvailabilityAndScarcity(
+    MachineBasicBlock &MBB, const LivenessScanState &State) {
   // Second-stage full coverage pruning.
   // This happens AFTER register class filtering.
   pruneByFullCoverage();
@@ -1006,15 +1298,63 @@ void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
   computeAvailableFromLiveRanges(ReservedRegs);
   deriveSuperRegsFromSubRegs();
 
-  addUnusedCallerSavedRegs(MBB, ImplicitRegs, ReservedRegs);
+  addUnusedCallerSavedRegs(MBB, State.ImplicitRegs, ReservedRegs);
   markScarceRanges();
 
   // Compute and cache the most promising scarce range set.
   MostPromisingScarceRanges = findMostPromisingScarceRanges(AvailablePhysRegs);
 }
 
+void RegLiveRangeTracker::analyze(MachineBasicBlock &MBB,
+                                  ArrayRef<MachineInstr *> SemanticOrder) {
+  assert(!SemanticOrder.empty() && "SemanticOrder must be provided - MBB order "
+                                   "is unreliable after scheduling");
+  clear();
+
+  // Initialize state for liveness scan.
+  LivenessScanState State;
+
+  // Build instruction order map and collect operands.
+  buildInstructionOrderAndCollectOperands(SemanticOrder, State);
+
+  // Initialize live registers from live-outs.
+  initLiveRegsFromLiveOuts(MBB, State);
+
+  // Perform the liveness scan to build live ranges.
+  performLivenessScan(SemanticOrder, State);
+
+  // Extract lane masks from LiveRegs for the isFullyDefined check.
+  DenseMap<MCRegister, LaneBitmask> LocalLiveLaneMasks;
+  for (const auto &[Reg, Info] : State.LiveRegs) {
+    LocalLiveLaneMasks[Reg] = Info.second;
+  }
+
+  // Apply first-stage safety filtering.
+  applySafetyFiltering(MBB, State, LocalLiveLaneMasks);
+
+  // Compute register classes and apply filtering.
+  computeRegisterClassesAndFilter();
+
+  // Finalize availability and scarcity.
+  finalizeAvailabilityAndScarcity(MBB, State);
+}
+
+void RegLiveRange::setRegisterClass(const TargetRegisterClass *RC) {
+  RegisterClass = RC;
+
+  // Populate AdmissibleRegs from RegisterClass.
+  // This is initially equivalent to the RC membership, but can be further
+  // constrained later by per-LR requirements (e.g., bypass constraints).
+  AdmissibleRegs.clear();
+  if (RC) {
+    for (MCPhysReg Reg : *RC) {
+      AdmissibleRegs.insert(Reg);
+    }
+  }
+}
+
 void RegLiveRangeTracker::computeRegisterClass(RegLiveRange &LR) const {
-  if (LR.BaseReg == MCRegister::NoRegister)
+  if (LR.getBaseReg() == MCRegister::NoRegister)
     return;
 
   // Start with nullptr, representing the universe of all register classes.
@@ -1044,8 +1384,8 @@ void RegLiveRangeTracker::computeRegisterClass(RegLiveRange &LR) const {
         } else {
           CommonRC = TRI->getCommonSubClass(CommonRC, OpRC);
           if (!CommonRC) {
-            // No common class possible - this live range is illegal
-            LR.RegisterClass = nullptr;
+            // No common class possible - this live range is illegal.
+            LR.setRegisterClass(nullptr);
             return;
           }
         }
@@ -1053,23 +1393,13 @@ void RegLiveRangeTracker::computeRegisterClass(RegLiveRange &LR) const {
     }
   }
 
-  // If no operand constraints were found, fall back to minimal class
+  // If no operand constraints were found, fall back to minimal class.
   if (!CommonRC) {
-    CommonRC = TRI->getMinimalPhysRegClass(LR.BaseReg);
+    CommonRC = TRI->getMinimalPhysRegClass(LR.getBaseReg());
     assert(CommonRC && "Physical register must have a register class");
   }
 
-  LR.RegisterClass = CommonRC;
-
-  // Populate AdmissibleRegs from RegisterClass.
-  // This is initially equivalent to the RC membership, but can be further
-  // constrained later by per-LR requirements (e.g., bypass constraints).
-  LR.AdmissibleRegs.clear();
-  if (CommonRC) {
-    for (MCPhysReg Reg : *CommonRC) {
-      LR.AdmissibleRegs.insert(Reg);
-    }
-  }
+  LR.setRegisterClass(CommonRC);
 }
 
 void RegLiveRangeTracker::virtualizeFilteredPhysRegs(OverlapPolicy Policy) {
@@ -1084,7 +1414,7 @@ void RegLiveRangeTracker::virtualizeFilteredPhysRegs(OverlapPolicy Policy) {
   DenseSet<MCRegister> ReservedBases;
   for (const RegLiveRange &LR : LiveRanges) {
     if (LR.isReserved()) {
-      ReservedBases.insert(LR.BaseReg);
+      ReservedBases.insert(LR.getBaseReg());
     }
   }
 
@@ -1093,10 +1423,11 @@ void RegLiveRangeTracker::virtualizeFilteredPhysRegs(OverlapPolicy Policy) {
   for (RegLiveRange &LR : reverse(LiveRanges)) {
     // The analysis should have filtered out any live ranges without a valid
     // register class.
-    assert(LR.RegisterClass && "Live range must have a valid register class");
+    assert(LR.getRegisterClass() &&
+           "Live range must have a valid register class");
 
     // The analysis should have assigned a base register to every live range.
-    assert(LR.BaseReg != MCRegister::NoRegister &&
+    assert(LR.getBaseReg() != MCRegister::NoRegister &&
            "Live range must have a base register");
 
     // Never virtualize RESERVED ranges themselves.
@@ -1109,7 +1440,7 @@ void RegLiveRangeTracker::virtualizeFilteredPhysRegs(OverlapPolicy Policy) {
       // Check if this LR's base register overlaps any RESERVED base.
       bool OverlapsReserved = false;
       for (MCRegister ReservedBase : ReservedBases) {
-        if (TRI->regsOverlap(LR.BaseReg, ReservedBase)) {
+        if (TRI->regsOverlap(LR.getBaseReg(), ReservedBase)) {
           OverlapsReserved = true;
           break;
         }
@@ -1122,7 +1453,7 @@ void RegLiveRangeTracker::virtualizeFilteredPhysRegs(OverlapPolicy Policy) {
     // If Policy == AllowOverlapWithReservedBase, we proceed to virtualize.
 
     // Create a virtual register for this live range.
-    const Register VReg = MRI.createVirtualRegister(LR.RegisterClass);
+    const Register VReg = MRI.createVirtualRegister(LR.getRegisterClass());
 
     // Store the VReg in the LiveRange for later mapping.
     LR.setVReg(VReg);
@@ -1213,11 +1544,11 @@ void RegLiveRangeTracker::filterByRegisterAvailability() {
   // Lambda to check if a live range has only one choice of physical register.
   auto HasNoChoice = [&](const RegLiveRange &LR) -> bool {
     // By this point, all live ranges should have a register class.
-    assert(LR.RegisterClass && "Live range must have a register class");
+    assert(LR.getRegisterClass() && "Live range must have a register class");
 
     // Count how many physical registers from this register class are available.
     unsigned AvailableCount = 0;
-    for (MCPhysReg PhysReg : *LR.RegisterClass) {
+    for (MCPhysReg PhysReg : *LR.getRegisterClass()) {
       if (AvailablePhysRegs.count(PhysReg)) {
         AvailableCount++;
         // If we find at least 2, this live range has choices.
@@ -1238,7 +1569,7 @@ void RegLiveRangeTracker::filterByRegisterAvailability() {
     // Skip live ranges that have no choice of physical register.
     if (HasNoChoice(LR)) {
       LLVM_DEBUG(dbgs() << "Filtering out live range for "
-                        << TRI->getName(LR.BaseReg)
+                        << TRI->getName(LR.getBaseReg())
                         << " - no alternative physical registers\n");
       continue;
     }

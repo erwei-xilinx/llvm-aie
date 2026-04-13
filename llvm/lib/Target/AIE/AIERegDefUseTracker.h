@@ -32,6 +32,7 @@
 namespace llvm {
 
 struct AIEBaseInstrInfo;
+struct LaneBitmask;
 class MachineBasicBlock;
 class MachineFunction;
 class MachineInstr;
@@ -102,6 +103,11 @@ private:
 public:
   RegLiveRange() = default;
 
+  /// Construct a live range with the given ID, base register, and reserved
+  /// status. This is the primary constructor used when creating new ranges.
+  RegLiveRange(int ID, MCRegister BaseReg, bool IsReserved = false)
+      : BaseReg(BaseReg), IsReserved(IsReserved), ID(ID) {}
+
   void addDef(MachineOperand *DefOp, unsigned SubRegIdx);
   void addUse(MachineOperand *UseOp, unsigned SubRegIdx);
 
@@ -122,30 +128,16 @@ public:
     return llvm::concat<const RegOperandInfo>(Uses, Defs);
   }
 
-  /// Get the base register for this live range
+  /// Get the base register for this live range.
   MCRegister getBaseReg() const { return BaseReg; }
-
-  /// Set the base register for this live range
-  void setBaseReg(MCRegister Reg) { BaseReg = Reg; }
 
   /// Get the register class for this live range.
   const TargetRegisterClass *getRegisterClass() const { return RegisterClass; }
-
-  /// Set the register class for this live range.
-  void setRegisterClass(const TargetRegisterClass *RC) { RegisterClass = RC; }
 
   /// Get the admissible physical registers for this live range.
   const DenseSet<MCRegister> &getAdmissibleRegs() const {
     return AdmissibleRegs;
   }
-
-  /// Set the admissible physical registers for this live range.
-  void setAdmissibleRegs(DenseSet<MCRegister> Regs) {
-    AdmissibleRegs = std::move(Regs);
-  }
-
-  /// Add a register to the admissible set.
-  void addAdmissibleReg(MCRegister Reg) { AdmissibleRegs.insert(Reg); }
 
   /// Check if a register is admissible for this live range.
   bool isAdmissible(MCRegister Reg) const {
@@ -173,14 +165,41 @@ public:
   /// Set whether this live range is reserved
   void setIsReserved(bool Reserved) { IsReserved = Reserved; }
 
-  /// Get the unique ID for this live range
+  /// Get the unique ID for this live range.
   int getID() const { return ID; }
 
-  /// Dump a brief summary of this live range for debugging
-  void dumpBrief(const TargetRegisterInfo *TRI) const;
+  /// Set the register class and populate AdmissibleRegs.
+  /// AdmissibleRegs is initially populated from the register class membership.
+  void setRegisterClass(const TargetRegisterClass *RC);
 
-  // Friend class to allow RegLiveRangeTracker to access internals for merging
-  friend class RegLiveRangeTracker;
+  /// Merge another live range into this one.
+  /// Copies all defs and uses from Other into this range.
+  /// Updates BaseReg to the smallest register that contains all operands from
+  /// both ranges. This handles sibling registers (e.g., cml4 and cmh4) by
+  /// finding their common super-register (dm4).
+  /// Other is NOT cleared after the merge (caller must do that if needed).
+  /// @param Other The live range to merge from.
+  /// @param TRI Target register info for computing sub-register indices.
+  void mergeFrom(const RegLiveRange &Other, const TargetRegisterInfo *TRI);
+
+  /// Expand the base register to include an external register.
+  /// This is used for registers that affect the live range's base (e.g.,
+  /// live-out sentinels) but don't have corresponding operands.
+  /// If ExtReg is larger than BaseReg, or if they are siblings requiring
+  /// a common super-register, BaseReg is updated accordingly.
+  /// Existing operands have their SubRegIdx values recomputed.
+  /// @param ExtReg The external register to include.
+  /// @param TRI Target register info for computing sub-register indices.
+  void expandBaseToInclude(MCRegister ExtReg, const TargetRegisterInfo *TRI);
+
+  /// Clear all state, making this an invalid/empty range.
+  void clear();
+
+  /// Check if this live range is empty/invalid.
+  bool isEmpty() const { return ID < 0; }
+
+  /// Dump a brief summary of this live range for debugging.
+  void dumpBrief(const TargetRegisterInfo *TRI) const;
 };
 
 /// Tracker for register live ranges in a MachineBasicBlock
@@ -222,21 +241,26 @@ class RegLiveRangeTracker {
   void computeRegisterClass(RegLiveRange &LR) const;
 
   /// First-stage safety filtering.
-  bool startsWithDefInBlock(const RegLiveRange &LR) const;
   bool hasTiedOperands(const RegLiveRange &LR) const;
 
   /// Check if a live range's base register is fully defined in the block.
-  /// Returns false if the base register overlaps with any register in LiveRegs,
-  /// which indicates incomplete definition (some parts still live from before).
-  bool isFullyDefined(const RegLiveRange &LR,
-                      const DenseMap<MCRegister, int> &LiveRegs) const;
+  /// Uses lane mask intersection with the block's live-in set to determine
+  /// if the register is truly defined within the block or comes from outside.
+  /// This can discriminate between a truly undefined register (not in live-in,
+  /// safe to virtualize) and a register defined outside the loop (in live-in,
+  /// should be rejected to preserve loop-carried values).
+  bool
+  isFullyDefined(const RegLiveRange &LR,
+                 const DenseMap<MCRegister, LaneBitmask> &LocalLiveLaneMasks,
+                 const MachineBasicBlock &MBB) const;
 
   /// Second-stage full coverage pruning
   void pruneByFullCoverage();
 
-  /// Merge aliasing live ranges when a definition is encountered
+  /// Merge aliasing live ranges when a definition is encountered.
   void mergeAliasingLiveRanges(
-      unsigned DefLRIdx, MCRegister DefReg, DenseMap<MCRegister, int> &LiveRegs,
+      unsigned DefLRIdx, MCRegister DefReg,
+      DenseMap<MCRegister, std::pair<int, LaneBitmask>> &LiveRegs,
       DenseMap<MachineOperand *, unsigned> &OperandToLiveRange);
 
   /// Helper to find the most promising scarce range set.
@@ -267,6 +291,62 @@ class RegLiveRangeTracker {
 
   /// Mark live ranges as scarce if they have exactly 1 available register.
   void markScarceRanges();
+
+  //===--------------------------------------------------------------------===//
+  // Analyze helper methods (decomposition of analyze())
+  //===--------------------------------------------------------------------===//
+
+  /// State passed through the liveness scan.
+  /// Groups the mutable state that is threaded through the backward scan.
+  struct LivenessScanState {
+    /// Map from register to its current live range index (signed) and lane
+    /// mask. Use NoLiveRange as sentinel for live-out registers not yet
+    /// associated with a range.
+    DenseMap<MCRegister, std::pair<int, LaneBitmask>> LiveRegs;
+
+    /// Map from operand to live range index.
+    DenseMap<MachineOperand *, unsigned> OperandToLiveRange;
+
+    /// Set of registers used implicitly (invalidates explicit ranges).
+    DenseSet<MCRegister> ImplicitRegs;
+  };
+
+  /// Build instruction order map and collect physical register operands.
+  /// Also populates ImplicitRegs.
+  void buildInstructionOrderAndCollectOperands(
+      ArrayRef<MachineInstr *> SemanticOrder, LivenessScanState &State);
+
+  /// Initialize LiveRegs from live-out registers.
+  void initLiveRegsFromLiveOuts(const MachineBasicBlock &MBB,
+                                LivenessScanState &State);
+
+  /// Get or create a live range for a register operand.
+  /// Returns the live range index.
+  unsigned getOrCreateLiveRangeForOperand(MCRegister Reg, MachineOperand *MO,
+                                          LivenessScanState &State);
+
+  /// Process def operands for a single instruction (reverse pass).
+  void processDefsInInstruction(MachineInstr &MI, LivenessScanState &State);
+
+  /// Process use operands for a single instruction (reverse pass).
+  void processUsesInInstruction(MachineInstr &MI, LivenessScanState &State);
+
+  /// Perform the liveness scan over all instructions.
+  void performLivenessScan(ArrayRef<MachineInstr *> SemanticOrder,
+                           LivenessScanState &State);
+
+  /// Apply first-stage safety filtering to live ranges.
+  /// Returns the lane masks collected during analysis for isFullyDefined.
+  void applySafetyFiltering(
+      const MachineBasicBlock &MBB, const LivenessScanState &State,
+      const DenseMap<MCRegister, LaneBitmask> &LocalLiveLaneMasks);
+
+  /// Compute register classes and apply register class filtering.
+  void computeRegisterClassesAndFilter();
+
+  /// Finalize available registers and scarcity after all filtering.
+  void finalizeAvailabilityAndScarcity(MachineBasicBlock &MBB,
+                                       const LivenessScanState &State);
 
 public:
   RegLiveRangeTracker(MachineBasicBlock &MBB);
