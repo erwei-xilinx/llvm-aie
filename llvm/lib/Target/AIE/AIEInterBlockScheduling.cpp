@@ -690,9 +690,12 @@ SchedulingStage InterBlockScheduling::updateScheduling(BlockState &BS) {
         return SchedulingStage::SchedulingDone;
       }
 
-      BS.FixPoint.II = PostSWP.getResMII(*BS.TheBlock);
-      BS.FixPoint.IITries = 1;
-      return SchedulingStage::Pipelining;
+      const int ResMII = PostSWP.getResMII(*BS.TheBlock);
+      if (ResMII <= PostPipelinerMaxII) {
+        BS.FixPoint.II = ResMII;
+        BS.FixPoint.IITries = 1;
+        return SchedulingStage::Pipelining;
+      }
     }
   }
   return SchedulingStage::SchedulingDone;
