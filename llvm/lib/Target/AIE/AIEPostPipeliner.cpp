@@ -1282,15 +1282,17 @@ bool PostPipeliner::tryApproaches() {
   // Therefore, if we haven't found a solution yet, bring in the big guns.
   if (II == TargetII) {
     const SolverData Data = createSolverData();
-    int NS = MinLength / II;
+    const int NS = MinLength / II;
     if (solve(Data, NS, false)) {
       return true;
     }
-    if (NS == MinTripCount) {
-      // Only try this at the boundary case
-      if (solve(Data, NS + 1, true)) {
-        return true;
-      }
+    // Let's try SEF solution.
+    if (solve(Data, NS + 1, true)) {
+      return true;
+    }
+    // Hail Mary: last try with NS + 1.
+    if (solve(Data, NS + 1, false)) {
+      return true;
     }
   }
 
