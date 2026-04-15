@@ -10,7 +10,7 @@
 
 # RUN: llc -mtriple=aie2ps -O2 --start-before=postmisched %s \
 # RUN:   --aie-postpipeliner-heuristic-runs=1 \
-# RUN:   --aie-postpipeliner-target-ii=4 \
+# RUN:   --aie-postpipeliner-solver \
 # RUN:   -o - | FileCheck %s
 
 # MaxPool2D inner loop (10 instructions) with VSEL.

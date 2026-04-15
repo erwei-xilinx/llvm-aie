@@ -3,13 +3,14 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# (c) Copyright 2025 Advanced Micro Devices, Inc. or its affiliates
+# (c) Copyright 2025-2026 Advanced Micro Devices, Inc. or its affiliates
 
 # REQUIRES: enable_z3_solver
 
 # RUN: llc -verify-machineinstrs --mtriple=aie2p -O2 %s \
 # RUN:   --start-before=postmisched \
 # RUN:   --aie-postpipeliner-heuristic-runs=1 \
+# RUN:   --aie-postpipeliner-solver \
 # RUN:   -o - | FileCheck %s
 
 

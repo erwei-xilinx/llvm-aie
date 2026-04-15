@@ -242,11 +242,6 @@ class PostPipeliner {
   /// The minimum tripcount, read from the pragma, or from an LC initialization.
   int MinTripCount = 0;
 
-  /// The II requested by a pragma. This will trigger expensive algorithms
-  /// like solvers or exhaustive searches to be run if the heuristic methods
-  /// don't find a solution.
-  int TargetII = 0;
-
   /// The Preheader of the loop.
   MachineBasicBlock *Preheader = nullptr;
 

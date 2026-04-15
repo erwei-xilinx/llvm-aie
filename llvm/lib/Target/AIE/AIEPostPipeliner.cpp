@@ -23,7 +23,6 @@
 #include "llvm/CodeGen/ResourceScoreboard.h"
 #include "llvm/CodeGen/ScheduleDAG.h"
 #include "llvm/CodeGen/ScheduleDAGInstrs.h"
-#include "llvm/Transforms/Utils/LoopUtils.h"
 #include <limits>
 #include <numeric>
 #include <string>
@@ -44,9 +43,10 @@ static cl::opt<int>
                   cl::desc("Number of runs for heuristics that converge"),
                   cl::init(20), cl::Hidden);
 
-static cl::opt<int> PresetII("aie-postpipeliner-target-ii",
-                             cl::desc("II for which to allow the solver"),
-                             cl::init(0), cl::Hidden);
+static cl::opt<bool>
+    UseSolver("aie-postpipeliner-solver",
+              cl::desc("Use the solver as fallback after heuristics fail"),
+              cl::init(false), cl::Hidden);
 
 static cl::opt<int>
     SolverRetries("aie-postpipeliner-solver-retries",
@@ -163,16 +163,6 @@ bool PostPipeliner::isPostPipelineCandidate(MachineBasicBlock &LoopBlock) {
   if (MinTripCount < 2) {
     LLVM_DEBUG(dbgs() << " PostPipeliner: min tripcount < 2\n");
     return false;
-  }
-
-  if (PresetII) {
-    TargetII = PresetII;
-    return true;
-  }
-  auto ParsedInitiationInterval = getInitiationInterval(getLoopID(LoopBlock));
-  if (ParsedInitiationInterval) {
-    TargetII = *ParsedInitiationInterval;
-    DEBUG_SUMMARY(dbgs() << " PostPipeliner: TargetII=" << TargetII << "\n");
   }
 
   return true;
@@ -1284,9 +1274,8 @@ bool PostPipeliner::tryApproaches() {
     return true;
   }
 
-  // TargetII is the OK from the user to spend some time reaching this II.
-  // Therefore, if we haven't found a solution yet, bring in the big guns.
-  if (II == TargetII) {
+  // If the solver is enabled, try it as a fallback after heuristics fail.
+  if (UseSolver) {
     const SolverData Data = createSolverData();
     const int NS = MinLength / II;
     if (solve(Data, NS, false)) {
