@@ -1206,9 +1206,13 @@ void llvm::applyAddVecEltUndef(MachineInstr &MI, MachineRegisterInfo &MRI,
 /// Get or create an s32 value from an s20 register that comes from either:
 /// 1. G_TRUNC of s32 -> returns the original s32 register
 /// 2. G_ZEXTLOAD of s16 -> returns the s20 register (already zero-extended)
+/// \param S20Reg The s20 register to extract the source from
+/// \param MRI Machine register info
+/// \param OnlyTruncs If true, only accept G_TRUNC patterns (not G_ZEXTLOAD)
 /// Returns std::nullopt if the pattern doesn't match
 static std::optional<Register> getS32SourceFromS20(Register S20Reg,
-                                                   MachineRegisterInfo &MRI) {
+                                                   MachineRegisterInfo &MRI,
+                                                   bool OnlyTruncs = false) {
   MachineInstr *DefMI = MRI.getVRegDef(S20Reg);
   if (!DefMI)
     return std::nullopt;
@@ -1226,7 +1230,8 @@ static std::optional<Register> getS32SourceFromS20(Register S20Reg,
   }
 
   // Case 2: G_ZEXTLOAD (loads s16, zero-extends to s20)
-  if (DefMI->getOpcode() == TargetOpcode::G_ZEXTLOAD) {
+  // Skip this case if OnlyTruncs is true
+  if (!OnlyTruncs && DefMI->getOpcode() == TargetOpcode::G_ZEXTLOAD) {
     if (!DefMI->memoperands_empty()) {
       const MachineMemOperand *MMO = *DefMI->memoperands_begin();
       if (MMO && MMO->getMemoryType() == LLT::scalar(16)) {
@@ -1371,6 +1376,131 @@ bool llvm::matchChainedPtrAddWithTruncOrZextLoad(MachineInstr &MI,
     // Build the combined PTR_ADD at the location of the root (second PTR_ADD)
     B.setInstr(MI);
     B.buildPtrAdd(SecondPtrAddDst, FirstPtrAddBase, CombinedS20);
+  };
+
+  return true;
+}
+
+/// Match a pattern of G_AIE_POSTINC_LOAD/STORE followed by G_PTR_ADD where both
+/// offsets come from G_TRUNC of s32 values. Combines them by updating the
+/// POSTINC to use the combined offset.
+bool llvm::matchPostIncLoadStorePtrAddWithTrunc(MachineInstr &MI,
+                                                MachineRegisterInfo &MRI,
+                                                CombinerHelper &Helper,
+                                                const AIEBaseInstrInfo &TII,
+                                                BuildFnTy &MatchInfo) {
+  assert(MI.getOpcode() == TargetOpcode::G_PTR_ADD && "Expected G_PTR_ADD");
+
+  // This is the PTR_ADD that follows the POSTINC_LOAD
+  const Register PtrAddDst = MI.getOperand(0).getReg();
+  const Register PtrAddBase = MI.getOperand(1).getReg();
+  const Register PtrAddOffset = MI.getOperand(2).getReg();
+
+  LLVM_DEBUG(dbgs() << "Checking POSTINC_LOAD+PTR_ADD pattern for: " << MI);
+
+  // Get s32 source for PTR_ADD offset (only from TRUNC, not ZEXTLOAD)
+  auto PtrAddS32Opt =
+      getS32SourceFromS20(PtrAddOffset, MRI, /*OnlyTruncs=*/true);
+  if (!PtrAddS32Opt) {
+    LLVM_DEBUG(dbgs() << "  PTR_ADD offset not from G_TRUNC\n");
+    return false;
+  }
+  const Register PtrAddS32Reg = *PtrAddS32Opt;
+
+  // Check if base comes from G_AIE_POSTINC_LOAD or G_AIE_POSTINC_STORE
+  MachineInstr *PostIncMI = MRI.getVRegDef(PtrAddBase);
+  if (!PostIncMI)
+    return false;
+
+  const unsigned PostIncOpc = PostIncMI->getOpcode();
+  const bool IsPostIncLoad = (PostIncOpc == TII.getGenericPostIncLoadOpcode());
+  const bool IsPostIncStore =
+      (PostIncOpc == TII.getGenericPostIncStoreOpcode());
+
+  if (!IsPostIncLoad && !IsPostIncStore)
+    return false;
+
+  // Verify the POSTINC's pointer output has only one use (the PTR_ADD)
+  if (!MRI.hasOneNonDBGUse(PtrAddBase))
+    return false;
+
+  // POSTINC_LOAD has: def0 (data), def1 (pointer), use0 (base ptr), use1
+  // (offset) POSTINC_STORE has: def0 (pointer), use0 (data), use1 (base ptr),
+  // use2 (offset)
+  const unsigned PtrOutIdx = IsPostIncLoad ? 1 : 0;
+  const unsigned OffsetIdx = 3;
+
+  const Register PostIncPtr = PostIncMI->getOperand(PtrOutIdx).getReg();
+  const Register PostIncOffset = PostIncMI->getOperand(OffsetIdx).getReg();
+
+  // Verify pointer output matches PTR_ADD base
+  if (PostIncPtr != PtrAddBase)
+    return false;
+
+  // Get s32 source for POSTINC offset (only from TRUNC, not ZEXTLOAD)
+  auto PostIncS32Opt =
+      getS32SourceFromS20(PostIncOffset, MRI, /*OnlyTruncs=*/true);
+  if (!PostIncS32Opt)
+    return false;
+  const Register PostIncS32Reg = *PostIncS32Opt;
+
+  // Get the definitions of both s32 source registers
+  MachineInstr *PostIncS32DefMI = MRI.getVRegDef(PostIncS32Reg);
+  MachineInstr *PtrAddS32DefMI = MRI.getVRegDef(PtrAddS32Reg);
+
+  if (!PostIncS32DefMI || !PtrAddS32DefMI)
+    return false;
+
+  // Check dominance: we need one to dominate the other
+  Register DominatingReg, DominatedReg;
+  MachineInstr *InsertionPoint = nullptr;
+
+  if (Helper.dominates(*PostIncS32DefMI, *PtrAddS32DefMI)) {
+    // PostInc s32 dominates PtrAdd s32
+    DominatingReg = PostIncS32Reg;
+    DominatedReg = PtrAddS32Reg;
+    InsertionPoint = PtrAddS32DefMI;
+  } else if (Helper.dominates(*PtrAddS32DefMI, *PostIncS32DefMI)) {
+    // PtrAdd s32 dominates PostInc s32
+    DominatingReg = PtrAddS32Reg;
+    DominatedReg = PostIncS32Reg;
+    InsertionPoint = PostIncS32DefMI;
+  } else {
+    // No dominance relation - cannot proceed safely
+    return false;
+  }
+
+  // Verify insertion point dominates the POSTINC
+  if (!Helper.dominates(*InsertionPoint, *PostIncMI))
+    return false;
+
+  // Build the lambda that will perform the transformation
+  MatchInfo = [=, &MRI](MachineIRBuilder &B) {
+    // Set insertion point right after the dominated definition
+    // Be careful to not insert between phi nodes.
+    MachineBasicBlock *InsertPtMBB = InsertionPoint->getParent();
+    MachineBasicBlock::iterator InsertPt =
+        std::next(InsertionPoint->getIterator());
+    if (InsertPt != InsertPtMBB->end() && InsertPt->isPHI())
+      InsertPt = InsertPtMBB->getFirstNonPHI();
+
+    B.setInsertPt(*InsertPtMBB, *InsertPt);
+
+    // Build G_ADD of the two s32 values
+    const LLT S32 = LLT::scalar(32);
+    const Register CombinedS32 = MRI.createGenericVirtualRegister(S32);
+    B.buildAdd(CombinedS32, DominatingReg, DominatedReg);
+
+    // Build G_TRUNC to s20
+    const LLT S20 = LLT::scalar(20);
+    const Register CombinedS20 = MRI.createGenericVirtualRegister(S20);
+    B.buildTrunc(CombinedS20, CombinedS32);
+
+    // Update the POSTINC (LOAD or STORE) to use the combined offset and output
+    // to PtrAddDst Note: We don't use Observer here since it's not available in
+    // the lambda context
+    PostIncMI->getOperand(OffsetIdx).setReg(CombinedS20); // Update offset
+    PostIncMI->getOperand(PtrOutIdx).setReg(PtrAddDst); // Update pointer output
   };
 
   return true;
