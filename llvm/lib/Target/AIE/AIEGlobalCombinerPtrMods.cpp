@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// (c) Copyright 2025 Advanced Micro Devices, Inc. or its affiliates
+// (c) Copyright 2025-2026 Advanced Micro Devices, Inc. or its affiliates
 //
 //===----------------------------------------------------------------------===//
 //
@@ -427,6 +427,19 @@ bool OffsetCombiner::isReorderCandidate(
       // generate invalid mir
       return false;
     }
+  }
+
+  // Reject if the DAG has an order dependency (barrier, memory alias) from
+  // any instruction between the two insertion points to the offset load.
+  // Moving the load above such a dependency would violate memory ordering.
+  const SUnit &LoadSU = DAG->SUnits[InsertionPointNodeNum];
+  for (const SDep &Pred : LoadSU.Preds) {
+    if (Pred.getKind() != SDep::Order)
+      continue;
+    const unsigned PredNodeNum = Pred.getSUnit()->NodeNum;
+    if (PredNodeNum > PostIncCombiner->InsertionPointNodeNum &&
+        PredNodeNum < InsertionPointNodeNum)
+      return false;
   }
 
   // OffsetCombiner occurs after PostIncCombiner
