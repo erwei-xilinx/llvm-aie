@@ -21,6 +21,7 @@
 #include "AIEMultiSlotInstrMaterializer.h"
 #include "Utils/AIELoopUtils.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/CodeGen/MachineScheduler.h"
@@ -367,6 +368,8 @@ public:
       Epilogue = &InterBlock.getBlockState(S);
     }
   }
+  const BlockState *getPrologue() const { return Prologue; }
+  const BlockState *getEpilogue() const { return Epilogue; }
 };
 
 } // namespace
@@ -395,6 +398,32 @@ bool InterBlockScheduling::leaveBlock() {
     auto &PostSWP = BS.getPostSWP();
     PostSWP.visitPipelineSchedule(GenSchedule);
     PostSWP.updateTripCount();
+
+    // Attribute the schedule to the actual prologue/loop/epilogue MBBs that
+    // received the bundles, so tests can assert on II, NS and the paid cost
+    // (prologue/epilogue sizes) independently of instruction layout.
+    MachineBasicBlock *LoopBB = BS.TheBlock;
+    const BlockState *PrologueBS = GenSchedule.getPrologue();
+    const BlockState *EpilogueBS = GenSchedule.getEpilogue();
+    MachineOptimizationRemarkEmitter More(*LoopBB->getParent(), nullptr);
+    auto DbgLoc = LoopBB->begin()->getDebugLoc();
+    More.emit([&]() {
+      auto R = MachineOptimizationRemark("postpipeliner", "schedule", DbgLoc,
+                                         LoopBB);
+      R << "Schedule found" << ore::NV("II", PostSWP.getII())
+        << ore::NV("NS", PostSWP.getStageCount())
+        << ore::NV("Loop", LoopBB->getName());
+      if (PrologueBS) {
+        R << ore::NV("Prologue", PrologueBS->TheBlock->getName())
+          << ore::NV("PrologueBundles",
+                     unsigned(PrologueBS->BottomInsert.size()));
+      }
+      if (EpilogueBS) {
+        R << ore::NV("Epilogue", EpilogueBS->TheBlock->getName())
+          << ore::NV("EpilogueBundles", unsigned(EpilogueBS->TopInsert.size()));
+      }
+      return R;
+    });
     break;
   }
   case SchedulingStage::SchedulingDone:
@@ -634,17 +663,9 @@ SchedulingStage InterBlockScheduling::updatePipelining(BlockState &BS) {
     return SchedulingStage::Pipelining;
   }
 
-  auto *BB = BS.TheBlock;
-  auto DbgLoc = BB->begin()->getDebugLoc();
-  MachineOptimizationRemarkEmitter More(*BB->getParent(), nullptr);
-  More.emit([&]() {
-    return MachineOptimizationRemarkMissed("postpipeliner", "schedule", DbgLoc,
-                                           BB)
-           << "No schedule found.";
-  });
-
   // Fall back to the loop schedule. Note that we can only enter pipeline mode
-  // after the loop schedule has stabilized.
+  // after the loop schedule has stabilized. Failure is observable by the
+  // absence of a "Schedule found" remark on this loop.
   return SchedulingStage::PipeliningFailed;
 }
 

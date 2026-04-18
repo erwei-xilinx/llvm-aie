@@ -19,9 +19,13 @@
   ; CHECK-NEXT: Function:        gemm
   ; CHECK-NEXT: Args:
   ; CHECK-NEXT:   - String:          Schedule found
-  ; CHECK-NEXT:   - NS:              '4'
   ; CHECK-NEXT:   - II:              '8'
-  ; CHECK-NEXT:   - BasicBlock:              for.body
+  ; CHECK-NEXT:   - NS:              '4'
+  ; CHECK-NEXT:   - Loop:            for.body
+  ; CHECK-NEXT:   - Prologue:        entry
+  ; CHECK-NEXT:   - PrologueBundles: '21'
+  ; CHECK-NEXT:   - Epilogue:        ''
+  ; CHECK-NEXT:   - EpilogueBundles: '24'
   ; CHECK-NEXT: ...
   entry:
     %cmp5 = icmp sgt i32 %n, 0
@@ -49,12 +53,23 @@
 
 
   define dso_local void @gemm_lowitercount(ptr addrspace(5) noalias nocapture writeonly %d, ptr addrspace(6) noalias nocapture readonly %s, i32 noundef %n) local_unnamed_addr {
-  ; CHECK: --- !Missed
+  ; A low min-iteration count forces the pipeliner to bump II until the stage
+  ; count shrinks enough to preserve a positive trip count. At II=15 / NS=2
+  ; the loop does pipeline, so we still get a Passed remark — just with a
+  ; larger II and a smaller prologue/epilogue than @gemm.
+  ; CHECK: --- !Passed
   ; CHECK-NEXT: Pass:            postpipeliner
   ; CHECK-NEXT: Name:            schedule
   ; CHECK-NEXT: Function:        gemm_lowitercount
   ; CHECK-NEXT: Args:
-  ; CHECK-NEXT:   - String:          No schedule found.
+  ; CHECK-NEXT:   - String:          Schedule found
+  ; CHECK-NEXT:   - II:              '15'
+  ; CHECK-NEXT:   - NS:              '2'
+  ; CHECK-NEXT:   - Loop:            for.body
+  ; CHECK-NEXT:   - Prologue:        entry
+  ; CHECK-NEXT:   - PrologueBundles: '16'
+  ; CHECK-NEXT:   - Epilogue:        ''
+  ; CHECK-NEXT:   - EpilogueBundles: '15'
   ; CHECK-NEXT: ...
   entry:
     %cmp5 = icmp sgt i32 %n, 0
